@@ -58,8 +58,11 @@ def parse_callback_time(timeline_text: str, tz_name: str = "UTC") -> datetime | 
             parsed = json.loads(raw)
             dt_str = parsed.get("scheduled_at")
             if dt_str:
-                dt_local = datetime.fromisoformat(dt_str).replace(tzinfo=tz)
-                return dt_local.astimezone(timezone.utc)
+                dt_parsed = datetime.fromisoformat(dt_str)
+                # Only attach tz if naive; if Groq returned an offset-aware string, convert directly
+                if dt_parsed.tzinfo is None:
+                    dt_parsed = dt_parsed.replace(tzinfo=tz)
+                return dt_parsed.astimezone(timezone.utc)
         except Exception:
             pass
 
@@ -103,12 +106,15 @@ def parse_callback_time(timeline_text: str, tz_name: str = "UTC") -> datetime | 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def schedule_followup(lead_id: int, campaign_id: int, timeline_text: str,
-                      product: str, lat: float = None, lon: float = None) -> bool:
+                      product: str, lat: float = None, lon: float = None,
+                      tz_hint: str = None, region: str = None,
+                      language: str = None) -> bool:
     """
     Parse timeline_text, save a scheduled_calls row, return True if scheduled.
+    tz_hint: pre-resolved timezone name (skips GPS lookup when already known).
     """
     from business_hours import get_timezone
-    tz_name = (get_timezone(lat, lon) if lat and lon else None) or "UTC"
+    tz_name = tz_hint or (get_timezone(lat, lon) if lat and lon else None) or "UTC"
     scheduled_utc = parse_callback_time(timeline_text, tz_name)
 
     if not scheduled_utc:
@@ -118,13 +124,22 @@ def schedule_followup(lead_id: int, campaign_id: int, timeline_text: str,
     r2_goal = generate_goal(product, round_num=2)
 
     with get_conn() as conn:
+        # Prevent duplicate pending rows for the same lead
+        existing = conn.execute(
+            "SELECT id FROM scheduled_calls WHERE lead_id=? AND status IN ('pending','in_progress')",
+            (lead_id,)
+        ).fetchone()
+        if existing:
+            print(f"  [Scheduler] Skipping duplicate — lead {lead_id} already has a pending scheduled call.")
+            return True  # Already scheduled, not an error
+
         conn.execute(
             """INSERT INTO scheduled_calls
-               (lead_id, campaign_id, scheduled_at, timezone, status, round, goal_script)
-               VALUES (?,?,?,?,?,?,?)""",
-            (lead_id, campaign_id,
-             scheduled_utc.isoformat(),
-             tz_name, "pending", 2, r2_goal)
+               (lead_id, campaign_id, scheduled_at, timezone, status, round,
+                goal_script, region, language)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (lead_id, campaign_id, scheduled_utc.isoformat(),
+             tz_name, "pending", 2, r2_goal, region, language)
         )
         conn.commit()
 
@@ -137,7 +152,7 @@ def get_pending_scheduled() -> list:
     with get_conn() as conn:
         return conn.execute(
             """SELECT sc.*, l.phone, l.lat, l.lon, l.masked_phone,
-                      c.product_description
+                      c.product_description, c.location
                FROM scheduled_calls sc
                JOIN leads l ON l.id = sc.lead_id
                JOIN campaigns c ON c.id = sc.campaign_id
@@ -149,30 +164,34 @@ def get_pending_scheduled() -> list:
 # ── Call firing ───────────────────────────────────────────────────────────────
 
 def _fire(row) -> None:
-    lead_id   = row["lead_id"]
-    sched_id  = row["id"]
-    phone     = row["phone"]
-    goal      = row["goal_script"]
-    product   = row["product_description"]
-    lat, lon  = row["lat"], row["lon"]
-    masked    = row["masked_phone"] or _mask_phone(phone)
+    lead_id     = row["lead_id"]
+    sched_id    = row["id"]
+    phone       = row["phone"]
+    goal        = row["goal_script"]
+    product     = row["product_description"]
+    campaign_id = row["campaign_id"]
+    tz_name     = row["timezone"] or "UTC"
+    region      = row["region"]
+    language    = row["language"]
+    masked      = row["masked_phone"] or _mask_phone(phone)
 
-    print(f"\n[Scheduler] Firing R2 call -> {masked}  (scheduled_calls.id={sched_id})")
+    print(f"\n[Scheduler] Firing scheduled call -> {masked}  (scheduled_calls.id={sched_id})")
 
     from caller import (execute_call_pipeline, extract_round2_fields,
-                        parse_transcript_to_json, infer_from_transcript,
-                        classify_round1)
-    from models import get_conn, _mask_phone
+                        parse_transcript_to_json, infer_from_transcript)
 
     try:
+        # Pass lat=None, lon=None — vendor explicitly requested this callback time,
+        # so we always honour it regardless of business hours.
         status_output = execute_call_pipeline(
-            phone=phone, goal=goal, dry_run=False, lat=lat, lon=lon
+            phone=phone, goal=goal, dry_run=False,
+            lat=None, lon=None, region=region, language=language
         )
         if status_output.get("status") == "SKIPPED":
             _update_status(sched_id, "skipped")
             return
 
-        call_id  = status_output.get("run_id") or status_output.get("id") or "unknown"
+        call_id   = status_output.get("run_id") or status_output.get("id") or "unknown"
         extracted = extract_round2_fields(status_output)
         lines     = parse_transcript_to_json(status_output)
         inference = {}
@@ -199,10 +218,38 @@ def _fire(row) -> None:
             conn.commit()
 
         _update_status(sched_id, "fired")
-        print(f"  [Scheduler] R2 completed for lead {lead_id}. Status: {status_output.get('status')}")
+        print(f"  [Scheduler] Call completed for lead {lead_id}. Status: {status_output.get('status')}")
+
+        # If CALLE returned report_blocked OR inference found a new callback time, schedule next round
+        new_timeline = ""
+        if status_output.get("callback_requested"):
+            # Extract from transcript directly — vendor said a time during the call
+            if lines:
+                raw_text = " ".join(l.get("text", "") for l in lines)
+                m = re.search(r'(\d+)\s*minute', raw_text, re.IGNORECASE)
+                if m:
+                    new_timeline = f"in {m.group(1)} minutes"
+        if not new_timeline and lines and inference:
+            new_timeline = inference.get("timeline") or inference.get("next_steps") or ""
+
+        if new_timeline and new_timeline not in ("null", "None", "", "-", "—"):
+            print(f"  [Scheduler] Detected callback request: '{new_timeline[:80]}'")
+            # Pass tz_name so relative times ("in 10 minutes") resolve in vendor's timezone
+            scheduled = schedule_followup(
+                lead_id=lead_id,
+                campaign_id=campaign_id,
+                timeline_text=new_timeline,
+                product=product,
+                lat=None, lon=None,
+                tz_hint=tz_name,
+                region=region,
+                language=language,
+            )
+            if not scheduled:
+                print(f"  [Scheduler] Could not parse time from: '{new_timeline[:60]}'")
 
     except Exception as e:
-        print(f"  [Scheduler] R2 call failed for lead {lead_id}: {e}")
+        print(f"  [Scheduler] Call failed for lead {lead_id}: {e}")
         _update_status(sched_id, "failed")
 
 
@@ -224,10 +271,18 @@ def _poll_loop():
                 if due.tzinfo is None:
                     due = due.replace(tzinfo=timezone.utc)
                 if now_utc >= due:
-                    threading.Thread(target=_fire, args=(row,), daemon=True).start()
+                    # Claim the row atomically before spawning thread — prevents double-fire
+                    with get_conn() as conn:
+                        updated = conn.execute(
+                            "UPDATE scheduled_calls SET status='in_progress' WHERE id=? AND status='pending'",
+                            (row["id"],)
+                        ).rowcount
+                        conn.commit()
+                    if updated:
+                        threading.Thread(target=_fire, args=(row,), daemon=True).start()
         except Exception as e:
             print(f"[Scheduler] Poll error: {e}")
-        _time.sleep(30)
+        _time.sleep(10)
 
 
 def start_scheduler_thread():
@@ -238,4 +293,4 @@ def start_scheduler_thread():
         t = threading.Thread(target=_poll_loop, daemon=True)
         t.start()
         _scheduler_started = True
-        print("[Scheduler] Background thread started — polling every 30s")
+        print("[Scheduler] Background thread started — polling every 10s")

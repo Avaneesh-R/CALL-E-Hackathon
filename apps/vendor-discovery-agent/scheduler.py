@@ -385,9 +385,12 @@ def _update_status(sched_id: int, status: str):
 
 def _get_retry_count(lead_id: int) -> int:
     with get_conn() as conn:
-        row = conn.execute("SELECT retry_count FROM leads WHERE id=?", (lead_id,)).fetchone()
-        if row and row["retry_count"] is not None:
-            return row["retry_count"]
+        row = conn.execute(
+            "SELECT COALESCE(retry_count, 0) AS rc FROM leads WHERE id=?",
+            (lead_id,)
+        ).fetchone()
+        if row and row["rc"] is not None:
+            return row["rc"]
         return 0
 
 

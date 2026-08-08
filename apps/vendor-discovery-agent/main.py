@@ -9,7 +9,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from models import init_db, get_conn, Lead, Campaign, _mask_phone
-from discovery import discover_vendors
+from discovery import discover_vendors, _looks_spam
 from script_gen import generate_goal, prompt_client_approval
 from caller import (execute_call_pipeline, classify_round1, extract_round2_fields,
                     parse_transcript_to_json, infer_from_transcript)
@@ -81,15 +81,55 @@ def print_results_table(conn, campaign_id: int):
     print(f"\n{ATTRIBUTION}")
 
 
+EXPORT_HEADERS = ["ID", "Name", "Phone (masked)", "Category", "Status",
+                  "Interest", "Can Supply", "Price Range", "Timeline",
+                  "Contact Name", "Next Steps", "Summary", "Candidate ID"]
+
+
+def _gather_export_rows(conn, campaign_id: int):
+    """Return sqlite rows for a campaign, joining the latest round-1/round-2 call log per lead."""
+    return conn.execute(
+        """SELECT l.id, l.name, l.masked_phone, l.phone, l.category, l.status,
+                  l.candidate_id,
+                  r2log.extracted_fields AS r2_fields,
+                  r1log.extracted_fields AS r1_fields
+           FROM leads l
+           LEFT JOIN (
+               SELECT lead_id, extracted_fields FROM call_logs
+               WHERE id IN (SELECT MAX(id) FROM call_logs WHERE round=1 GROUP BY lead_id)
+           ) r1log ON r1log.lead_id=l.id
+           LEFT JOIN (
+               SELECT lead_id, extracted_fields FROM call_logs
+               WHERE id IN (SELECT MAX(id) FROM call_logs WHERE round=2 GROUP BY lead_id)
+           ) r2log ON r2log.lead_id=l.id
+           WHERE l.campaign_id = ?
+           ORDER BY l.id""",
+        (campaign_id,)
+    ).fetchall()
+
+
+def _export_row_to_dict(r) -> dict:
+    r2 = json.loads(r["r2_fields"]) if r["r2_fields"] else {}
+    r1 = json.loads(r["r1_fields"]) if r["r1_fields"] else {}
+    summary = r2.get("summary") or r1.get("summary") or ""
+    masked = r["masked_phone"] or _mask_phone(r["phone"])
+    values = [
+        r["id"], r["name"] or "", masked, r["category"] or "", r["status"],
+        r1.get("interest_level", ""), r2.get("can_supply", ""),
+        r2.get("price_range", ""), r2.get("timeline", ""),
+        r2.get("contact_name", ""), r2.get("next_steps", ""),
+        summary, r["candidate_id"] or "",
+    ]
+    return dict(zip(EXPORT_HEADERS, values))
+
+
 def export_excel(campaign_id: int, path: str):
     import openpyxl
     from openpyxl.styles import PatternFill, Font
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Leads"
-    headers = ["ID", "Name", "Phone (masked)", "Category", "Status",
-               "Interest", "Can Supply", "Price Range", "Timeline",
-               "Contact Name", "Next Steps", "Summary", "Candidate ID"]
+    headers = EXPORT_HEADERS
     header_fill = PatternFill("solid", fgColor="1F4E79")
     header_font = Font(color="FFFFFF", bold=True)
     for col, h in enumerate(headers, 1):
@@ -98,31 +138,10 @@ def export_excel(campaign_id: int, path: str):
         cell.font = header_font
 
     with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT l.id, l.name, l.masked_phone, l.phone, l.category, l.status,
-                      l.candidate_id,
-                      r2log.extracted_fields AS r2_fields,
-                      r1log.extracted_fields AS r1_fields
-               FROM leads l
-               LEFT JOIN call_logs r1log ON r1log.lead_id = l.id AND r1log.round = 1
-               LEFT JOIN call_logs r2log ON r2log.lead_id = l.id AND r2log.round = 2
-               WHERE l.campaign_id = ?
-               ORDER BY l.id""",
-            (campaign_id,)
-        ).fetchall()
+        rows = _gather_export_rows(conn, campaign_id)
 
     for row_num, r in enumerate(rows, 2):
-        r2 = json.loads(r["r2_fields"]) if r["r2_fields"] else {}
-        r1 = json.loads(r["r1_fields"]) if r["r1_fields"] else {}
-        summary = r2.get("summary") or r1.get("summary") or ""
-        masked = r["masked_phone"] or _mask_phone(r["phone"])
-        ws.append([
-            r["id"], r["name"] or "", masked, r["category"] or "", r["status"],
-            r1.get("interest_level", ""), r2.get("can_supply", ""),
-            r2.get("price_range", ""), r2.get("timeline", ""),
-            r2.get("contact_name", ""), r2.get("next_steps", ""),
-            summary, r["candidate_id"] or "",
-        ])
+        ws.append([_export_row_to_dict(r)[h] for h in EXPORT_HEADERS])
 
     ws.column_dimensions["B"].width = 28
     ws.column_dimensions["C"].width = 18
@@ -131,9 +150,42 @@ def export_excel(campaign_id: int, path: str):
     print(f"\nExported {len(rows)} leads to {path}")
 
 
+def export_csv(campaign_id: int, path: str):
+    """Export campaign results to CSV."""
+    import csv
+    with get_conn() as conn:
+        rows = _gather_export_rows(conn, campaign_id)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=EXPORT_HEADERS)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(_export_row_to_dict(r))
+    print(f"\nExported {len(rows)} leads to {path}")
+
+
+def export_json(campaign_id: int, path: str):
+    """Export campaign results to JSON."""
+    with get_conn() as conn:
+        rows = _gather_export_rows(conn, campaign_id)
+    data = [_export_row_to_dict(r) for r in rows]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"\nExported {len(rows)} leads to {path}")
+
+
+def _run_exports(campaign_id, export=None, export_csv_path=None, export_json_path=None):
+    if export:
+        export_excel(campaign_id, export)
+    if export_csv_path:
+        export_csv(campaign_id, export_csv_path)
+    if export_json_path:
+        export_json(campaign_id, export_json_path)
+
+
 def run_campaign(product: str, location: str, limit: int,
                  region: str, language: str, dry_run: bool, yes: bool = False,
-                 export: str = None, skip_hours_gate: bool = False):
+                 export: str = None, skip_hours_gate: bool = False,
+                 export_csv_path: str = None, export_json_path: str = None):
     init_db()
 
     print(f"\nVendor Discovery & Outreach")
@@ -174,7 +226,20 @@ def run_campaign(product: str, location: str, limit: int,
         campaign_id = campaign.id
         conn.commit()
 
-        leads = [save_lead(conn, v, campaign_id) for v in vendors]
+        leads = []
+        for v in vendors:
+            if _looks_spam(v["phone"]):
+                print(f"  [Skip] {_mask_phone(v['phone'])} — spam/invalid number")
+                continue
+            dup = conn.execute("SELECT id FROM leads WHERE phone=?", (v["phone"],)).fetchone()
+            if dup:
+                print(f"  [Skip] {_mask_phone(v['phone'])} — already in DB (lead {dup['id']})")
+                continue
+            leads.append(save_lead(conn, v, campaign_id))
+
+    if not leads:
+        print("\nAll discovered vendors were skipped (spam or already in DB).")
+        return
 
     # Generate and get approval for round-1 script
     r1_goal = generate_goal(product, round_num=1)
@@ -190,6 +255,7 @@ def run_campaign(product: str, location: str, limit: int,
     print(f"{'-'*60}")
 
     positives = []
+    uncertain = []
     for lead in leads:
         print(f"\n[{lead.name}]")
         try:
@@ -225,6 +291,10 @@ def run_campaign(product: str, location: str, limit: int,
                 update_lead_status(conn, lead.id, outcome, call_id, round_num=1)
                 log_call(conn, lead.id, call_id, 1, status_output,
                          {"transcript": transcript_lines, **inference} if transcript_lines else inference)
+
+            if outcome == "unknown":
+                uncertain.append(lead)
+                print(f"  [Uncertain] {lead.name} — outcome unclear, not queued for R2")
 
             if outcome == "positive":
                 positives.append(lead)
@@ -265,9 +335,11 @@ def run_campaign(product: str, location: str, limit: int,
         print("\nNo positive responses from round 1.")
         with get_conn() as conn:
             print_results_table(conn, campaign_id)
-        if export:
-            export_excel(campaign_id, export)
+        _run_exports(campaign_id, export, export_csv_path, export_json_path)
         return
+
+    if uncertain:
+        print(f"{len(uncertain)} uncertain lead(s) logged (excluded from round 2).")
 
     print(f"\n{len(positives)} positive response(s). Proceeding to round 2.")
 
@@ -316,8 +388,7 @@ def run_campaign(product: str, location: str, limit: int,
     with get_conn() as conn:
         print_results_table(conn, campaign_id)
 
-    if export:
-        export_excel(campaign_id, export)
+    _run_exports(campaign_id, export, export_csv_path, export_json_path)
 
 
 def main():
@@ -331,6 +402,10 @@ def main():
     parser.add_argument("--yes", "-y", action="store_true", help="Skip all confirmation prompts")
     parser.add_argument("--export-excel", metavar="FILE.xlsx", default=None,
                         help="Export results to Excel after campaign completes")
+    parser.add_argument("--export-csv", metavar="FILE.csv", default=None,
+                        help="Export results to CSV after campaign completes")
+    parser.add_argument("--export-json", metavar="FILE.json", default=None,
+                        help="Export results to JSON after campaign completes")
     parser.add_argument("--skip-hours-gate", action="store_true",
                         help="Bypass business-hours check (for testing only)")
     args = parser.parse_args()
@@ -345,6 +420,8 @@ def main():
         yes=args.yes,
         export=args.export_excel,
         skip_hours_gate=args.skip_hours_gate,
+        export_csv_path=args.export_csv,
+        export_json_path=args.export_json,
     )
 
 

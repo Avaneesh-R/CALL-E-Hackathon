@@ -17,6 +17,7 @@ def _migrate(conn):
     """Add new columns to existing DBs without breaking old ones."""
     cols_c = {r[1] for r in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
     cols_l = {r[1] for r in conn.execute("PRAGMA table_info(leads)").fetchall()}
+    cols_s = {r[1] for r in conn.execute("PRAGMA table_info(scheduled_calls)").fetchall()}
     for col, defn in [("consent_basis", "TEXT DEFAULT 'client-reviewed-and-approved'"),
                       ("consent_approved_at", "TEXT")]:
         if col not in cols_c:
@@ -25,6 +26,9 @@ def _migrate(conn):
                       ("skip_reason", "TEXT"), ("address", "TEXT")]:
         if col not in cols_l:
             conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {defn}")
+    for col, defn in [("region", "TEXT"), ("language", "TEXT")]:
+        if col not in cols_s:
+            conn.execute(f"ALTER TABLE scheduled_calls ADD COLUMN {col} {defn}")
 
 
 def init_db():
@@ -79,6 +83,8 @@ def init_db():
             status TEXT DEFAULT 'pending',
             round INTEGER DEFAULT 2,
             goal_script TEXT,
+            region TEXT,
+            language TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
         """)

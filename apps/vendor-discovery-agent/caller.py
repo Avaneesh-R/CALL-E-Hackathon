@@ -39,7 +39,7 @@ MAX_POLLS = 40  # 10 minutes max per call
 def _run(args: list[str]) -> dict:
     result = subprocess.run(
         [CALLE] + args,
-        capture_output=True, text=True, env=_CALLE_ENV
+        capture_output=True, text=True, encoding="utf-8", env=_CALLE_ENV
     )
     if result.returncode != 0:
         raise RuntimeError(f"calle {' '.join(args)} failed:\n{result.stderr}")
@@ -208,6 +208,11 @@ def infer_from_transcript(transcript_lines: list[dict], product_description: str
         temperature=0.1,
     )
     text = response.choices[0].message.content.strip()
+    # Fix UTF-8 bytes misread as Latin-1 (e.g. ₹ appearing as â‚¹)
+    try:
+        text = text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
     # Strip markdown fences if model added them
     if text.startswith("```"):
         text = re.sub(r"^```[a-z]*\n?", "", text)
@@ -259,5 +264,14 @@ def execute_call_pipeline(phone: str, goal: str, region: str = None, language: s
 
     print(f"  Run ID: {run_id} — polling for completion...")
     final_status = poll_until_done(run_id)
-    print(f"  Done. Status: {final_status.get('status')}")
+    raw_status = (final_status.get("status") or "").upper().replace(" ", "_")
+    print(f"  Done. Status: {raw_status}")
+
+    # Detect CALLE's report_blocked — vendor requested a callback but CALLE won't auto-retry.
+    # Inject a synthetic "callback_requested" key so callers can detect and schedule.
+    next_step = final_status.get("next_step") or {}
+    if isinstance(next_step, dict) and next_step.get("action") == "report_blocked":
+        final_status["callback_requested"] = True
+        print("  [Pipeline] CALLE report_blocked — callback scheduling handed to us.")
+
     return final_status

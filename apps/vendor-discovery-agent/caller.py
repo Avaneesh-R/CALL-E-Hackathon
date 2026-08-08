@@ -7,6 +7,7 @@ import re
 import time
 import subprocess
 import sys
+import concurrent.futures as _cf
 from pathlib import Path
 
 import os as _os
@@ -34,6 +35,10 @@ _CALLE_ENV = (
 )
 POLL_INTERVAL = 15
 MAX_POLLS = 40  # 10 minutes max per call
+
+
+def _call_groq(client, **kwargs):
+    return client.chat.completions.create(**kwargs)
 
 
 def _run(args: list[str]) -> dict:
@@ -202,6 +207,9 @@ def infer_from_transcript(transcript_lines: list[dict], product_description: str
             '  "can_supply": true | false | null\n'
             '  "quantity_mentioned": string or null\n'
             '  "price_range": string or null\n'
+            '  "price_numeric": number or null  (price per unit as a plain float)\n'
+            '  "currency": string or null  (ISO code, e.g. "INR", "USD")\n'
+            '  "price_unit": string or null  (e.g. "per piece", "per dozen", "per kg")\n'
             '  "timeline": string or null\n'
             '  "next_steps": string or null\n'
             '  "summary": "one-sentence outcome"\n'
@@ -209,18 +217,22 @@ def infer_from_transcript(transcript_lines: list[dict], product_description: str
         )
 
     client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=512,
-        temperature=0.1,
-    )
+    with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_call_groq, client,
+                        model="llama-3.3-70b-versatile",
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=512, temperature=0.1)
+        try:
+            response = fut.result(timeout=20)
+        except _cf.TimeoutError:
+            return {"error": "groq_timeout"}
     text = response.choices[0].message.content.strip()
     # Fix UTF-8 bytes misread as Latin-1 (e.g. ₹ appearing as â‚¹)
-    try:
-        text = text.encode("latin-1").decode("utf-8")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        pass
+    if "Ã" in text or "â‚" in text or "â€" in text:
+        try:
+            text = text.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
     # Strip markdown fences if model added them
     if text.startswith("```"):
         text = re.sub(r"^```[a-z]*\n?", "", text)

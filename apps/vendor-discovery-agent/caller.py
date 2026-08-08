@@ -43,7 +43,11 @@ def _run(args: list[str]) -> dict:
     )
     if result.returncode != 0:
         raise RuntimeError(f"calle {' '.join(args)} failed:\n{result.stderr}")
-    outer = json.loads(result.stdout)
+    try:
+        outer = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        snippet = result.stdout[-300:] if result.stdout else "(empty)"
+        raise RuntimeError(f"calle JSON parse error: {e}\nStdout tail: {snippet}") from e
     # CLI wraps everything in {ok, result: {structuredContent, content, isError}}
     # Return structuredContent directly so callers get the flat schema
     return outer.get("result", {}).get("structuredContent") or outer
@@ -107,7 +111,11 @@ def classify_round1(status_output: dict) -> str:
     for sig in negative_signals:
         if sig in transcript.lower():
             score -= 2
-    return "positive" if score > 0 else "negative"
+    if score > 0:
+        return "positive"
+    if score < 0:
+        return "negative"
+    return "unknown"
 
 
 def _extract_transcript_text(status_output: dict) -> str:

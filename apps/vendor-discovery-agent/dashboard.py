@@ -80,7 +80,20 @@ tr.expand-row td{padding:0}
 .inf-row{display:flex;padding:3px 0;border-bottom:1px solid #1a1f26;font-size:.78rem}
 .inf-row:last-child{border-bottom:none}
 .inf-key{color:#8b949e;min-width:130px;flex-shrink:0}
-.inf-val{color:#c9d1d9;flex:1}
+.inf-val{color:#c9d1d9;flex:1;word-break:break-word}
+
+/* Raw JSON modal */
+.modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;align-items:center;justify-content:center}
+.modal-backdrop.open{display:flex}
+.modal-box{background:#161b22;border:1px solid #30363d;border-radius:10px;width:min(90vw,780px);max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-head{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #30363d}
+.modal-head h3{font-size:.85rem;color:#f0f6fc}
+.modal-close{background:none;border:none;color:#666;font-size:1.2rem;cursor:pointer;padding:0 4px;line-height:1}
+.modal-close:hover{color:#f85149}
+.modal-body{overflow:auto;padding:14px 16px;flex:1}
+pre.json-view{font-family:monospace;font-size:.76rem;color:#c9d1d9;white-space:pre-wrap;word-break:break-all;margin:0}
+.raw-btn{font-size:.62rem;background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:4px;padding:1px 7px;cursor:pointer;margin-left:6px;vertical-align:middle}
+.raw-btn:hover{color:#58a6ff;border-color:#58a6ff}
 
 /* Address */
 .address-tag{font-size:.72rem;color:#8b949e;font-style:italic;padding:2px 0}
@@ -113,6 +126,17 @@ tr.expand-row td{padding:0}
 <div class="sub">Data &copy; <a href="https://openstreetmap.org/copyright" target="_blank">OpenStreetMap contributors (ODbL)</a></div>
 <div class="refresh-tag">Refresh in <span id="cd">8</span>s</div>
 
+<!-- Raw JSON modal -->
+<div class="modal-backdrop" id="raw-modal" onclick="if(event.target===this)closeModal()">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="raw-modal-title">Full Inference JSON</h3>
+      <button class="modal-close" onclick="closeModal()">&#x2715;</button>
+    </div>
+    <div class="modal-body"><pre class="json-view" id="raw-modal-body"></pre></div>
+  </div>
+</div>
+
 <div id="stats" class="stats"></div>
 <div id="sched" style="display:none" class="sched-banner">
   <h3>&#128197; Scheduled Follow-up Calls</h3>
@@ -142,19 +166,56 @@ function renderTranscript(lines){
   }).join('');
 }
 
+// Store raw inference objects for modal display (avoids inline JSON injection)
+const _rawStore = {};
+let _storeIdx = 0;
+
+function openModalByKey(key){
+  const entry = _rawStore[key];
+  if(!entry) return;
+  document.getElementById('raw-modal-title').textContent = entry.title;
+  document.getElementById('raw-modal-body').textContent = JSON.stringify(entry.data, null, 2);
+  document.getElementById('raw-modal').classList.add('open');
+}
+function closeModal(){
+  document.getElementById('raw-modal').classList.remove('open');
+}
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
+
 function renderInference(inf, label){
   if(!inf||Object.keys(inf).length===0)
     return `<span style="color:#555;font-size:.75rem">No ${label} inference</span>`;
-  const SKIP = new Set(['transcript','raw_inference','error']);
-  return Object.entries(inf)
+
+  // Register in store so the View Raw button can access full data safely
+  const key = 'inf_' + (_storeIdx++);
+  _rawStore[key] = {title: label + ' — Full JSON', data: inf};
+
+  // Show all fields except transcript blob (rendered separately); show raw_inference & error
+  const SKIP = new Set(['transcript']);
+  const rows = Object.entries(inf)
     .filter(([k])=>!SKIP.has(k))
     .map(([k,v])=>{
       const val = Array.isArray(v)?v.join(', '):String(v??'—');
+      // Long values: show first 120 chars + "more" inline expand
+      if(val.length > 120){
+        return `<div class="inf-row">
+          <span class="inf-key">${escHtml(k.replace(/_/g,' '))}</span>
+          <span class="inf-val">
+            <span class="val-short">${escHtml(val.slice(0,120))}&hellip;
+              <button class="raw-btn" onclick="event.stopPropagation();this.parentNode.querySelector('.val-full').style.display='inline';this.style.display='none'">more</button>
+            </span>
+            <span class="val-full" style="display:none">${escHtml(val)}</span>
+          </span>
+        </div>`;
+      }
       return `<div class="inf-row">
         <span class="inf-key">${escHtml(k.replace(/_/g,' '))}</span>
         <span class="inf-val">${escHtml(val)}</span>
       </div>`;
     }).join('');
+
+  const rawBtn = `<button class="raw-btn" onclick="event.stopPropagation();openModalByKey('${key}')">&#123;&#125; View Raw</button>`;
+  return `<div style="display:flex;justify-content:flex-end;margin-bottom:6px">${rawBtn}</div>${rows}`;
 }
 
 function toggleExpand(leadId){

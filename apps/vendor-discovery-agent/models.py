@@ -21,7 +21,8 @@ def _migrate(conn):
                       ("consent_approved_at", "TEXT")]:
         if col not in cols_c:
             conn.execute(f"ALTER TABLE campaigns ADD COLUMN {col} {defn}")
-    for col, defn in [("masked_phone", "TEXT"), ("candidate_id", "TEXT"), ("skip_reason", "TEXT")]:
+    for col, defn in [("masked_phone", "TEXT"), ("candidate_id", "TEXT"),
+                      ("skip_reason", "TEXT"), ("address", "TEXT")]:
         if col not in cols_l:
             conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {defn}")
 
@@ -67,6 +68,18 @@ def init_db():
             timestamp TEXT DEFAULT (datetime('now')),
             raw_status_output TEXT,
             extracted_fields TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS scheduled_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER NOT NULL REFERENCES leads(id),
+            campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+            scheduled_at TEXT NOT NULL,
+            timezone TEXT DEFAULT 'UTC',
+            status TEXT DEFAULT 'pending',
+            round INTEGER DEFAULT 2,
+            goal_script TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
         );
         """)
         _migrate(conn)
@@ -117,6 +130,7 @@ class Lead:
     osm_id: Optional[str] = None
     candidate_id: Optional[str] = None
     skip_reason: Optional[str] = None
+    address: Optional[str] = None
     status: str = "not_called"
     id: Optional[int] = None
 
@@ -133,10 +147,11 @@ class Lead:
         else:
             cur = conn.execute(
                 """INSERT INTO leads (campaign_id, name, phone, masked_phone, category,
-                   lat, lon, osm_id, candidate_id, skip_reason)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                   lat, lon, osm_id, candidate_id, skip_reason, address)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (self.campaign_id, self.name, self.phone, self.masked_phone, self.category,
-                 self.lat, self.lon, self.osm_id, self.candidate_id, self.skip_reason)
+                 self.lat, self.lon, self.osm_id, self.candidate_id, self.skip_reason,
+                 self.address)
             )
             self.id = cur.lastrowid
         return self

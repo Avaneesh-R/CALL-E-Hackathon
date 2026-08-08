@@ -31,9 +31,24 @@ Keep the call under 5 minutes. If they can't answer any item, skip it and move o
 Thank them at the end and let them know someone will be in touch to move forward."""
 
 
-def generate_goal(product_description: str, round_num: int) -> str:
+def generate_goal(product_description: str, round_num: int,
+                  persona_name: str = None, persona_tone: str = "professional") -> str:
     template = ROUND1_TEMPLATE if round_num == 1 else ROUND2_TEMPLATE
-    return template.format(product=product_description).strip()
+    goal = template.format(product=product_description).strip()
+
+    persona_prefix = ""
+    if persona_name:
+        tone_desc = {
+            "professional": "professional and courteous",
+            "friendly": "warm, friendly and conversational",
+            "energetic": "enthusiastic and energetic",
+        }.get(persona_tone or "professional", "professional and courteous")
+        persona_prefix = (
+            f"You are {persona_name}, a procurement specialist. "
+            f"Use a {tone_desc} tone throughout the call. "
+        )
+
+    return persona_prefix + goal
 
 
 def prompt_client_approval(goal: str, round_num: int) -> str:

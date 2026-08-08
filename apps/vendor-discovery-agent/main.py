@@ -13,6 +13,7 @@ from discovery import discover_vendors
 from script_gen import generate_goal, prompt_client_approval
 from caller import (execute_call_pipeline, classify_round1, extract_round2_fields,
                     parse_transcript_to_json, infer_from_transcript)
+from scheduler import schedule_followup
 
 ATTRIBUTION = "Data (c) OpenStreetMap contributors (ODbL) - openstreetmap.org/copyright"
 
@@ -28,6 +29,7 @@ def save_lead(conn, vendor: dict, campaign_id: int) -> Lead:
         lon=vendor.get("lon"),
         osm_id=osm_id,
         candidate_id=f"osm:{osm_id}" if osm_id else None,
+        address=vendor.get("address"),
     )
     lead.save(conn)
     return lead
@@ -226,6 +228,31 @@ def run_campaign(product: str, location: str, limit: int,
 
             if outcome == "positive":
                 positives.append(lead)
+                # Auto-schedule R2 if vendor gave a callback time AND this is an OSM lead
+                if lead.osm_id and not dry_run:
+                    timeline = inference.get("timeline") or inference.get("next_steps") or ""
+                    if timeline and timeline not in ("null", "None", ""):
+                        scheduled = schedule_followup(
+                            lead_id=lead.id,
+                            campaign_id=campaign_id,
+                            timeline_text=timeline,
+                            product=product,
+                            lat=lead.lat,
+                            lon=lead.lon,
+                        )
+                        if not scheduled:
+                            print(f"  [Scheduler] Could not parse time from: '{timeline}'")
+                    # If no timeline in R1, also check R2 inference from same transcript
+                    elif transcript_lines:
+                        try:
+                            r2_inf = infer_from_transcript(transcript_lines, product, round_num=2)
+                            tl2 = r2_inf.get("timeline") or r2_inf.get("next_steps") or ""
+                            if tl2 and tl2 not in ("null", "None", ""):
+                                schedule_followup(lead_id=lead.id, campaign_id=campaign_id,
+                                                  timeline_text=tl2, product=product,
+                                                  lat=lead.lat, lon=lead.lon)
+                        except Exception:
+                            pass
         except Exception as e:
             print(f"  Error: {e}")
             with get_conn() as conn:

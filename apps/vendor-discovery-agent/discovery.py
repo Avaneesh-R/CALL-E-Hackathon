@@ -178,6 +178,21 @@ def discover_vendors(product_description: str, location: str, limit: int = 20) -
         if not phone or phone in seen_phones:
             continue
         seen_phones.add(phone)
+        # Build address from OSM addr:* tags
+        addr_parts = []
+        if t.get("addr:housenumber") and t.get("addr:street"):
+            addr_parts.append(f"{t['addr:housenumber']} {t['addr:street']}")
+        elif t.get("addr:street"):
+            addr_parts.append(t["addr:street"])
+        elif t.get("addr:full"):
+            addr_parts.append(t["addr:full"])
+        elif t.get("addr:place"):
+            addr_parts.append(t["addr:place"])
+        for key in ("addr:suburb", "addr:city", "addr:state", "addr:postcode"):
+            if t.get(key):
+                addr_parts.append(t[key])
+        address = ", ".join(addr_parts) if addr_parts else None
+
         vendors.append({
             "name": t.get("name", "Unknown"),
             "phone": phone,
@@ -185,6 +200,7 @@ def discover_vendors(product_description: str, location: str, limit: int = 20) -
             "lat": el.get("lat") or el.get("center", {}).get("lat"),
             "lon": el.get("lon") or el.get("center", {}).get("lon"),
             "osm_id": f"{el['type']}/{el['id']}",
+            "address": address,
         })
         if len(vendors) >= limit:
             break

@@ -87,6 +87,9 @@ def init_db():
             language TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
+
+        CREATE INDEX IF NOT EXISTS idx_scheduled_status_at
+        ON scheduled_calls(status, scheduled_at);
         """)
         _migrate(conn)
 

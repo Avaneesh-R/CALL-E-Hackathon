@@ -151,6 +151,16 @@ def _normalize_phone(raw: str) -> Optional[str]:
     return digits
 
 
+def _looks_spam(phone: str) -> bool:
+    """True for obviously fake/spam numbers: too few digits or all-same-digit repeats."""
+    digits = re.sub(r'\D', '', phone or "")
+    if len(digits) < 8:
+        return True
+    if len(set(digits)) <= 2:
+        return True
+    return False
+
+
 def discover_vendors(product_description: str, location: str, limit: int = 20) -> list[dict]:
     """
     Returns a list of vendor dicts with keys:

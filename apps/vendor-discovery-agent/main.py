@@ -239,6 +239,8 @@ def run_campaign(product: str, location: str, limit: int,
                             product=product,
                             lat=lead.lat,
                             lon=lead.lon,
+                            region=region,
+                            language=language,
                         )
                         if not scheduled:
                             print(f"  [Scheduler] Could not parse time from: '{timeline}'")
@@ -250,7 +252,8 @@ def run_campaign(product: str, location: str, limit: int,
                             if tl2 and tl2 not in ("null", "None", ""):
                                 schedule_followup(lead_id=lead.id, campaign_id=campaign_id,
                                                   timeline_text=tl2, product=product,
-                                                  lat=lead.lat, lon=lead.lon)
+                                                  lat=lead.lat, lon=lead.lon,
+                                                  region=region, language=language)
                         except Exception:
                             pass
         except Exception as e:

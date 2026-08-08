@@ -16,6 +16,9 @@ _HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Vendor Discovery Dashboard</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',sans-serif;background:#0f1117;color:#e0e0e0;padding:20px}
@@ -119,6 +122,23 @@ pre.json-view{font-family:monospace;font-size:.76rem;color:#c9d1d9;white-space:p
 /* Copy button */
 .copy-btn{font-size:.65rem;background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:4px;padding:1px 5px;cursor:pointer}
 .copy-btn:hover{color:#58a6ff}
+
+/* Tabs */
+.tabs{display:flex;gap:4px;border-bottom:1px solid #30363d;margin-bottom:18px}
+.tab-btn{background:none;border:none;border-bottom:2px solid transparent;color:#8b949e;font-size:.85rem;font-weight:600;padding:8px 16px;cursor:pointer;font-family:inherit}
+.tab-btn:hover{color:#c9d1d9}
+.tab-btn.active{color:#58a6ff;border-bottom-color:#58a6ff}
+.view{display:none}
+.view.active{display:block}
+
+/* Analytics charts */
+.chart-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:20px}
+@media(max-width:900px){.chart-grid{grid-template-columns:1fr}}
+.chart-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px}
+.chart-card h3{font-size:.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}
+.bench-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px}
+.bench-card h3{font-size:.85rem;color:#f0f6fc;margin-bottom:10px}
+#map-view .campaign{margin-bottom:0}
 </style>
 </head>
 <body>
@@ -137,12 +157,35 @@ pre.json-view{font-family:monospace;font-size:.76rem;color:#c9d1d9;white-space:p
   </div>
 </div>
 
-<div id="stats" class="stats"></div>
-<div id="sched" style="display:none" class="sched-banner">
-  <h3>&#128197; Scheduled Follow-up Calls</h3>
-  <div id="sched-list"></div>
+<div class="tabs">
+  <button class="tab-btn active" id="tab-leads" onclick="switchTab('leads')">Leads</button>
+  <button class="tab-btn" id="tab-analytics" onclick="switchTab('analytics')">Analytics</button>
+  <button class="tab-btn" id="tab-map" onclick="switchTab('map')">Map</button>
 </div>
-<div id="campaigns"></div>
+
+<div id="stats" class="stats"></div>
+
+<div id="leads-view" class="view active">
+  <div id="sched" style="display:none" class="sched-banner">
+    <h3>&#128197; Scheduled Follow-up Calls</h3>
+    <div id="sched-list"></div>
+  </div>
+  <div id="campaigns"></div>
+</div>
+
+<div id="analytics-view" class="view">
+  <div class="chart-grid">
+    <div class="chart-card"><h3>Outcomes</h3><div style="position:relative;height:280px"><canvas id="chart-outcomes"></canvas></div></div>
+    <div class="chart-card"><h3>Interest Level</h3><div style="position:relative;height:280px"><canvas id="chart-interest"></canvas></div></div>
+    <div class="chart-card"><h3>Sentiment Trend</h3><div style="position:relative;height:280px"><canvas id="chart-sentiment"></canvas></div></div>
+  </div>
+  <div class="bench-card">
+    <h3>Price Intelligence</h3>
+    <div id="bench-body"></div>
+  </div>
+</div>
+
+<div id="map-view" class="view" style="height:500px"></div>
 
 <script>
 const SC = {
@@ -150,6 +193,132 @@ const SC = {
   completed:'s-completed', not_called:'s-not_called', failed:'s-failed',
   skipped:'s-skipped', positive_r2:'s-positive_r2'
 };
+
+let _lastData = [];
+let _activeTab = 'leads';
+const _charts = {};
+let _map = null;
+let _mapMarkers = [];
+
+function switchTab(name){
+  _activeTab = name;
+  ['leads','analytics','map'].forEach(t=>{
+    document.getElementById('tab-'+t).classList.toggle('active', t===name);
+    document.getElementById(t+'-view').classList.toggle('active', t===name);
+  });
+  if(name==='analytics') renderAnalytics(_lastData);
+  if(name==='map') renderMap(_lastData);
+}
+
+const CHART_TXT = '#c9d1d9', CHART_GRID = '#30363d';
+
+function renderAnalytics(data){
+  // Outcomes donut
+  const outColors = {positive:'#56d364',negative:'#f85149',no_answer:'#e3b341',completed:'#58a6ff',failed:'#f85149',skipped:'#666'};
+  const outKeys = ['positive','negative','no_answer','completed','failed','skipped'];
+  const outCounts = Object.fromEntries(outKeys.map(k=>[k,0]));
+  data.forEach(c=>c.leads.forEach(l=>{ if(l.status in outCounts) outCounts[l.status]++; }));
+
+  // Interest bar
+  const intKeys = ['high','medium','low','none','unknown'];
+  const intColors = {high:'#56d364',medium:'#e3b341',low:'#f85149',none:'#666',unknown:'#8b949e'};
+  const intCounts = Object.fromEntries(intKeys.map(k=>[k,0]));
+  data.forEach(c=>c.leads.forEach(l=>{
+    const v = (l.r1_inference && l.r1_inference.interest_level) ? String(l.r1_inference.interest_level).toLowerCase() : 'unknown';
+    intCounts[v in intCounts ? v : 'unknown']++;
+  }));
+
+  // Sentiment trend: one point per campaign
+  const labels = [], pos = [], neu = [], neg = [];
+  data.forEach(c=>{
+    let p=0,n=0,g=0;
+    c.leads.forEach(l=>{
+      const s = (l.r1_inference && l.r1_inference.sentiment) ? String(l.r1_inference.sentiment).toLowerCase() : '';
+      if(s==='positive') p++; else if(s==='neutral') n++; else if(s==='negative') g++;
+    });
+    labels.push(trunc(c.product_description||('#'+c.id), 12));
+    pos.push(p); neu.push(n); neg.push(g);
+  });
+
+  const noGrid = {grid:{color:CHART_GRID,display:false},ticks:{color:CHART_TXT}};
+  const legendTop = {position:'top',labels:{color:CHART_TXT}};
+
+  _charts['outcomes']?.destroy();
+  _charts['outcomes'] = new Chart(document.getElementById('chart-outcomes'),{
+    type:'doughnut',
+    data:{labels:outKeys,datasets:[{data:outKeys.map(k=>outCounts[k]),backgroundColor:outKeys.map(k=>outColors[k]),borderColor:'#161b22'}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:legendTop}}
+  });
+
+  _charts['interest']?.destroy();
+  _charts['interest'] = new Chart(document.getElementById('chart-interest'),{
+    type:'bar',
+    data:{labels:intKeys,datasets:[{data:intKeys.map(k=>intCounts[k]),backgroundColor:intKeys.map(k=>intColors[k])}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:noGrid,y:{...noGrid,beginAtZero:true}}}
+  });
+
+  _charts['sentiment']?.destroy();
+  _charts['sentiment'] = new Chart(document.getElementById('chart-sentiment'),{
+    type:'line',
+    data:{labels:labels,datasets:[
+      {label:'positive',data:pos,borderColor:'#56d364',backgroundColor:'#56d364',tension:.2},
+      {label:'neutral',data:neu,borderColor:'#e3b341',backgroundColor:'#e3b341',tension:.2},
+      {label:'negative',data:neg,borderColor:'#f85149',backgroundColor:'#f85149',tension:.2},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:legendTop},scales:{x:noGrid,y:{...noGrid,beginAtZero:true}}}
+  });
+
+  renderBenchmark(data);
+}
+
+function renderBenchmark(data){
+  const order = {high:0,medium:1,low:2,none:3,unknown:4};
+  const rows = [];
+  data.forEach(c=>c.leads.forEach(l=>{
+    const pr = l.r2_inference && l.r2_inference.price_range;
+    if(pr!==null && pr!==undefined && String(pr).trim()!==''){
+      rows.push({
+        name: l.masked_phone || l.name || '?',
+        price: String(pr),
+        interest: (l.r1_inference && l.r1_inference.interest_level) ? String(l.r1_inference.interest_level).toLowerCase() : 'unknown',
+      });
+    }
+  }));
+  const box = document.getElementById('bench-body');
+  if(!rows.length){ box.innerHTML = '<span style="color:#555;font-size:.8rem">No R2 price data yet</span>'; return; }
+  rows.sort((a,b)=>(order[a.interest]??9)-(order[b.interest]??9));
+  box.innerHTML = `<table><thead><tr><th>Name</th><th>Price Range</th><th>Interest Level</th></tr></thead>
+    <tbody>${rows.map(r=>`<tr class="lead-row">
+      <td style="font-family:monospace;color:#79c0ff">${escHtml(r.name)}</td>
+      <td style="color:#c9d1d9">${escHtml(r.price)}</td>
+      <td>${escHtml(r.interest)}</td></tr>`).join('')}</tbody></table>`;
+}
+
+function renderMap(data){
+  const pts = [];
+  data.forEach(c=>c.leads.forEach(l=>{
+    if(l.lat!==null && l.lat!==undefined && l.lon!==null && l.lon!==undefined) pts.push(l);
+  }));
+  if(!_map){
+    const clat = pts.length ? pts.reduce((s,l)=>s+l.lat,0)/pts.length : 20.5937;
+    const clon = pts.length ? pts.reduce((s,l)=>s+l.lon,0)/pts.length : 78.9629;
+    _map = L.map('map-view', {zoomControl:true}).setView([clat,clon], pts.length?6:5);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution:'&copy; <a href="https://openstreetmap.org/copyright">OpenStreetMap contributors</a>'
+    }).addTo(_map);
+  }
+  _mapMarkers.forEach(m=>_map.removeLayer(m));
+  _mapMarkers = [];
+  const mc = {positive:'#56d364',completed:'#58a6ff',negative:'#f85149',no_answer:'#e3b341',not_called:'#8b949e',failed:'#f85149'};
+  pts.forEach(l=>{
+    const col = mc[l.r1_status] || '#8b949e';
+    const m = L.circleMarker([l.lat,l.lon], {radius:7,color:col,fillColor:col,fillOpacity:.8,weight:1});
+    m.bindPopup(`<b>${escHtml(l.name)}</b><br>${escHtml(l.category)}<br>${escHtml(l.r1_status)}`);
+    m.addTo(_map);
+    _mapMarkers.push(m);
+  });
+  setTimeout(()=>_map.invalidateSize(), 50);
+}
 function badge(s){ return `<span class="status ${SC[s]||'s-not_called'}">${s||'?'}</span>`; }
 function trunc(s,n){ return s&&s.length>n?s.slice(0,n)+'...':s||''; }
 function escHtml(s){ return s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):''; }
@@ -202,7 +371,7 @@ function renderInference(inf, label){
           <span class="inf-key">${escHtml(k.replace(/_/g,' '))}</span>
           <span class="inf-val">
             <span class="val-short">${escHtml(val.slice(0,120))}&hellip;
-              <button class="raw-btn" onclick="event.stopPropagation();this.parentNode.querySelector('.val-full').style.display='inline';this.style.display='none'">more</button>
+              <button class="raw-btn" onclick="event.stopPropagation();this.closest('.inf-val').querySelector('.val-full').style.display='inline';this.parentNode.style.display='none'">more</button>
             </span>
             <span class="val-full" style="display:none">${escHtml(val)}</span>
           </span>
@@ -232,6 +401,7 @@ async function load(){
     fetch('/api/campaigns').then(r=>r.json()),
     fetch('/api/scheduled').then(r=>r.json()),
   ]);
+  _lastData = data;
 
   // Stats
   let totLeads=0, totPos=0, totDone=0, totSched=0;
@@ -347,6 +517,9 @@ async function load(){
       </table>
     </div>
   `).join('');
+
+  if(_activeTab==='analytics') renderAnalytics(data);
+  if(_activeTab==='map') renderMap(data);
 }
 
 // Countdown + auto-refresh
@@ -392,8 +565,14 @@ def api_campaigns():
                           r1log.extracted_fields AS r1_fields,
                           r2log.extracted_fields AS r2_fields
                    FROM leads l
-                   LEFT JOIN call_logs r1log ON r1log.lead_id=l.id AND r1log.round=1
-                   LEFT JOIN call_logs r2log ON r2log.lead_id=l.id AND r2log.round=2
+                   LEFT JOIN (
+                       SELECT lead_id, extracted_fields FROM call_logs
+                       WHERE id IN (SELECT MAX(id) FROM call_logs WHERE round=1 GROUP BY lead_id)
+                   ) r1log ON r1log.lead_id=l.id
+                   LEFT JOIN (
+                       SELECT lead_id, extracted_fields FROM call_logs
+                       WHERE id IN (SELECT MAX(id) FROM call_logs WHERE round=2 GROUP BY lead_id)
+                   ) r2log ON r2log.lead_id=l.id
                    WHERE l.campaign_id=? ORDER BY l.id""",
                 (c["id"],)
             ).fetchall()
@@ -403,8 +582,23 @@ def api_campaigns():
                 r1_ef = json.loads(l["r1_fields"]) if l["r1_fields"] else {}
                 r2_ef = json.loads(l["r2_fields"]) if l["r2_fields"] else {}
 
-                # Separate transcript from inference
-                transcript = r1_ef.pop("transcript", [])
+                # Separate transcript from inference; handle string vs list format
+                raw_tr = r1_ef.pop("transcript", [])
+                if isinstance(raw_tr, str):
+                    from caller import parse_transcript_to_json
+                    transcript = parse_transcript_to_json({"result": {"transcript": raw_tr}})
+                else:
+                    transcript = raw_tr or []
+                # Also check r2 for transcript if r1 has none
+                if not transcript:
+                    raw_tr2 = r2_ef.pop("transcript", [])
+                    if isinstance(raw_tr2, str):
+                        from caller import parse_transcript_to_json
+                        transcript = parse_transcript_to_json({"result": {"transcript": raw_tr2}})
+                    else:
+                        transcript = raw_tr2 or []
+                else:
+                    r2_ef.pop("transcript", None)
                 summary = (r2_ef.get("summary") or r1_ef.get("summary")
                            or r2_ef.get("transcript_summary","")
                            or r1_ef.get("transcript_summary",""))

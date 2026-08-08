@@ -182,10 +182,26 @@ def _run_exports(campaign_id, export=None, export_csv_path=None, export_json_pat
         export_json(campaign_id, export_json_path)
 
 
+def _call_generate_goal(product, round_num, persona_name, persona_tone):
+    """Call generate_goal, passing persona kwargs only if its signature accepts them."""
+    import inspect
+    kwargs = {}
+    try:
+        params = inspect.signature(generate_goal).parameters
+        if "persona_name" in params:
+            kwargs["persona_name"] = persona_name
+        if "persona_tone" in params:
+            kwargs["persona_tone"] = persona_tone
+    except (TypeError, ValueError):
+        pass
+    return generate_goal(product, round_num=round_num, **kwargs)
+
+
 def run_campaign(product: str, location: str, limit: int,
                  region: str, language: str, dry_run: bool, yes: bool = False,
                  export: str = None, skip_hours_gate: bool = False,
-                 export_csv_path: str = None, export_json_path: str = None):
+                 export_csv_path: str = None, export_json_path: str = None,
+                 persona_name: str = None, persona_tone: str = "professional"):
     init_db()
 
     print(f"\nVendor Discovery & Outreach")
@@ -226,6 +242,12 @@ def run_campaign(product: str, location: str, limit: int,
         campaign_id = campaign.id
         conn.commit()
 
+        conn.execute(
+            "UPDATE campaigns SET persona_name=?, persona_tone=? WHERE id=?",
+            (persona_name, persona_tone, campaign_id)
+        )
+        conn.commit()
+
         leads = []
         for v in vendors:
             if _looks_spam(v["phone"]):
@@ -237,12 +259,30 @@ def run_campaign(product: str, location: str, limit: int,
                 continue
             leads.append(save_lead(conn, v, campaign_id))
 
+    # Score and sort leads by quality before calling
+    try:
+        from scoring import score_lead
+        with get_conn() as conn:
+            for lead in leads:
+                v = next((x for x in vendors if x.get("phone") == lead.phone), {})
+                score, reasons = score_lead(v)
+                lead.lead_score = score
+                conn.execute(
+                    "UPDATE leads SET lead_score=?, score_reasons=? WHERE id=?",
+                    (score, json.dumps(reasons), lead.id)
+                )
+            conn.commit()
+        leads.sort(key=lambda l: getattr(l, 'lead_score', 0), reverse=True)
+        print(f"  [Scoring] Leads prioritised by quality score.")
+    except ImportError:
+        pass  # scoring.py not yet present; harmless
+
     if not leads:
         print("\nAll discovered vendors were skipped (spam or already in DB).")
         return
 
     # Generate and get approval for round-1 script
-    r1_goal = generate_goal(product, round_num=1)
+    r1_goal = _call_generate_goal(product, round_num=1, persona_name=persona_name, persona_tone=persona_tone)
     r1_goal = r1_goal if yes else prompt_client_approval(r1_goal, round_num=1)
 
     with get_conn() as conn:
@@ -326,6 +366,21 @@ def run_campaign(product: str, location: str, limit: int,
                                                   region=region, language=language)
                         except Exception:
                             pass
+            elif outcome in ("no_answer", "failed", "busy") and lead.osm_id and not dry_run:
+                from scheduler import schedule_retry
+                attempt = 0  # first retry
+                scheduled = schedule_retry(
+                    lead_id=lead.id,
+                    campaign_id=campaign_id,
+                    product=product,
+                    attempt=attempt,
+                    lat=lead.lat,
+                    lon=lead.lon,
+                    region=region,
+                    language=language,
+                )
+                if scheduled:
+                    print(f"  [Retry] Scheduled retry #1 for lead {lead.id}")
         except Exception as e:
             print(f"  Error: {e}")
             with get_conn() as conn:
@@ -344,7 +399,7 @@ def run_campaign(product: str, location: str, limit: int,
     print(f"\n{len(positives)} positive response(s). Proceeding to round 2.")
 
     # Generate and get approval for round-2 script
-    r2_goal = generate_goal(product, round_num=2)
+    r2_goal = _call_generate_goal(product, round_num=2, persona_name=persona_name, persona_tone=persona_tone)
     r2_goal = r2_goal if yes else prompt_client_approval(r2_goal, round_num=2)
 
     # -- Round 2 --------------------------------------------------------------
@@ -408,6 +463,11 @@ def main():
                         help="Export results to JSON after campaign completes")
     parser.add_argument("--skip-hours-gate", action="store_true",
                         help="Bypass business-hours check (for testing only)")
+    parser.add_argument("--persona-name", default=None,
+                        help="Caller persona name (e.g. Alex)")
+    parser.add_argument("--persona-tone", default="professional",
+                        choices=["professional", "friendly", "energetic"],
+                        help="Caller persona tone (default professional)")
     args = parser.parse_args()
 
     run_campaign(
@@ -422,6 +482,8 @@ def main():
         skip_hours_gate=args.skip_hours_gate,
         export_csv_path=args.export_csv,
         export_json_path=args.export_json,
+        persona_name=args.persona_name,
+        persona_tone=args.persona_tone,
     )
 
 

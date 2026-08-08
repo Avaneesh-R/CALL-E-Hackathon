@@ -148,6 +148,57 @@ def schedule_followup(lead_id: int, campaign_id: int, timeline_text: str,
     return True
 
 
+RETRY_DELAYS = [
+    timedelta(minutes=30),
+    timedelta(hours=2),
+    timedelta(hours=24),  # next day
+]
+
+
+def schedule_retry(lead_id: int, campaign_id: int, product: str,
+                   attempt: int, lat: float = None, lon: float = None,
+                   tz_hint: str = None, region: str = None,
+                   language: str = None) -> bool:
+    """
+    Schedule a round-1 retry for a no-answer/busy lead.
+    attempt: 0-indexed (0 = first retry, max 2).
+    Returns True if scheduled, False if max retries exceeded.
+    """
+    if attempt >= len(RETRY_DELAYS):
+        return False
+
+    from datetime import datetime, timezone
+    delay = RETRY_DELAYS[attempt]
+    scheduled_utc = datetime.now(timezone.utc) + delay
+
+    from script_gen import generate_goal
+    r1_goal = generate_goal(product, round_num=1)
+    tz_name = tz_hint or "UTC"
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM scheduled_calls WHERE lead_id=? AND status IN ('pending','in_progress') AND round=1",
+            (lead_id,)
+        ).fetchone()
+        if existing:
+            return True  # already pending
+
+        conn.execute(
+            """INSERT INTO scheduled_calls
+               (lead_id, campaign_id, scheduled_at, timezone, status, round,
+                goal_script, region, language)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (lead_id, campaign_id, scheduled_utc.isoformat(),
+             tz_name, "pending", 1, r1_goal, region, language)
+        )
+        conn.commit()
+
+    from zoneinfo import ZoneInfo
+    local_display = scheduled_utc.astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M %Z")
+    print(f"  [Scheduler] R1 retry #{attempt+1} scheduled for {local_display} (lead_id={lead_id})")
+    return True
+
+
 def get_pending_scheduled() -> list:
     with get_conn() as conn:
         return conn.execute(
@@ -174,6 +225,12 @@ def _fire(row) -> None:
     region      = row["region"]
     language    = row["language"]
     masked      = row["masked_phone"] or _mask_phone(phone)
+    try:
+        round_num = row["round"]
+    except (KeyError, IndexError):
+        round_num = 2
+    if round_num is None:
+        round_num = 2
 
     print(f"\n[Scheduler] Firing scheduled call -> {masked}  (scheduled_calls.id={sched_id})")
 
@@ -192,6 +249,73 @@ def _fire(row) -> None:
             return
 
         call_id   = status_output.get("run_id") or status_output.get("id") or "unknown"
+
+        # ── Round-1 retry path (qualification), not round-2 data capture ──────
+        if round_num == 1:
+            from caller import classify_round1
+            outcome = classify_round1(status_output)
+            lines = parse_transcript_to_json(status_output)
+            inference = {}
+            if lines:
+                try:
+                    inference = infer_from_transcript(lines, product, round_num=1)
+                except Exception:
+                    pass
+
+            if outcome == "positive":
+                with get_conn() as conn:
+                    conn.execute("UPDATE leads SET status='positive' WHERE id=?", (lead_id,))
+                    conn.execute(
+                        """INSERT INTO call_logs (lead_id, call_id, round, raw_status_output, extracted_fields)
+                           VALUES (?,?,?,?,?)""",
+                        (lead_id, call_id, 1,
+                         json.dumps(status_output),
+                         json.dumps(inference) if inference else None)
+                    )
+                    conn.commit()
+                timeline = ""
+                if inference:
+                    timeline = inference.get("timeline") or inference.get("next_steps") or ""
+                schedule_followup(
+                    lead_id=lead_id, campaign_id=campaign_id,
+                    timeline_text=timeline, product=product,
+                    lat=None, lon=None, tz_hint=tz_name,
+                    region=region, language=language,
+                )
+                print(f"  [Scheduler] R1 retry positive for lead {lead_id} — R2 scheduled.")
+
+            elif outcome in ("no_answer", "busy", "failed"):
+                retry_count = _get_retry_count(lead_id)
+                scheduled = schedule_retry(
+                    lead_id=lead_id, campaign_id=campaign_id, product=product,
+                    attempt=retry_count, lat=None, lon=None, tz_hint=tz_name,
+                    region=region, language=language,
+                )
+                if scheduled:
+                    _increment_retry_count(lead_id)
+                    print(f"  [Scheduler] R1 retry {outcome} for lead {lead_id} — next retry queued (attempt {retry_count}).")
+                else:
+                    with get_conn() as conn:
+                        conn.execute("UPDATE leads SET status='exhausted' WHERE id=?", (lead_id,))
+                        conn.commit()
+                    print(f"  [Scheduler] R1 retries exhausted for lead {lead_id}.")
+
+            else:  # negative / unknown
+                with get_conn() as conn:
+                    conn.execute("UPDATE leads SET status='negative' WHERE id=?", (lead_id,))
+                    conn.execute(
+                        """INSERT INTO call_logs (lead_id, call_id, round, raw_status_output, extracted_fields)
+                           VALUES (?,?,?,?,?)""",
+                        (lead_id, call_id, 1,
+                         json.dumps(status_output),
+                         json.dumps(inference) if inference else None)
+                    )
+                    conn.commit()
+                print(f"  [Scheduler] R1 retry {outcome} for lead {lead_id} — marked negative.")
+
+            _update_status(sched_id, "fired")
+            return
+
         extracted = extract_round2_fields(status_output)
         lines     = parse_transcript_to_json(status_output)
         inference = {}
@@ -259,6 +383,20 @@ def _update_status(sched_id: int, status: str):
         conn.commit()
 
 
+def _get_retry_count(lead_id: int) -> int:
+    with get_conn() as conn:
+        row = conn.execute("SELECT retry_count FROM leads WHERE id=?", (lead_id,)).fetchone()
+        if row and row["retry_count"] is not None:
+            return row["retry_count"]
+        return 0
+
+
+def _increment_retry_count(lead_id: int):
+    with get_conn() as conn:
+        conn.execute("UPDATE leads SET retry_count = COALESCE(retry_count,0)+1 WHERE id=?", (lead_id,))
+        conn.commit()
+
+
 # ── Background polling thread ─────────────────────────────────────────────────
 
 def _poll_loop():
@@ -285,9 +423,24 @@ def _poll_loop():
         _time.sleep(10)
 
 
+def _recover_stale_in_progress():
+    """Reset in_progress rows older than 15 minutes back to pending on startup."""
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    with get_conn() as conn:
+        updated = conn.execute(
+            "UPDATE scheduled_calls SET status='pending' WHERE status='in_progress' AND created_at < ?",
+            (cutoff,)
+        ).rowcount
+        conn.commit()
+    if updated:
+        print(f"[Scheduler] Recovered {updated} stale in_progress row(s) → pending")
+
+
 def start_scheduler_thread():
     global _scheduler_started
     with _lock:
+        _recover_stale_in_progress()   # always run on startup, once per process
         if _scheduler_started:
             return
         t = threading.Thread(target=_poll_loop, daemon=True)

@@ -19,11 +19,14 @@ def _migrate(conn):
     cols_l = {r[1] for r in conn.execute("PRAGMA table_info(leads)").fetchall()}
     cols_s = {r[1] for r in conn.execute("PRAGMA table_info(scheduled_calls)").fetchall()}
     for col, defn in [("consent_basis", "TEXT DEFAULT 'client-reviewed-and-approved'"),
-                      ("consent_approved_at", "TEXT")]:
+                      ("consent_approved_at", "TEXT"),
+                      ("persona_name", "TEXT"), ("persona_tone", "TEXT")]:
         if col not in cols_c:
             conn.execute(f"ALTER TABLE campaigns ADD COLUMN {col} {defn}")
     for col, defn in [("masked_phone", "TEXT"), ("candidate_id", "TEXT"),
-                      ("skip_reason", "TEXT"), ("address", "TEXT")]:
+                      ("skip_reason", "TEXT"), ("address", "TEXT"),
+                      ("retry_count", "INTEGER DEFAULT 0"), ("lead_score", "REAL"),
+                      ("score_reasons", "TEXT")]:
         if col not in cols_l:
             conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {defn}")
     for col, defn in [("region", "TEXT"), ("language", "TEXT")]:
@@ -41,6 +44,8 @@ def init_db():
             goal_script TEXT,
             consent_basis TEXT DEFAULT 'client-reviewed-and-approved',
             consent_approved_at TEXT,
+            persona_name TEXT,
+            persona_tone TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
 
@@ -61,6 +66,9 @@ def init_db():
             status TEXT DEFAULT 'not_called',
             round1_call_id TEXT,
             round2_call_id TEXT,
+            retry_count INTEGER DEFAULT 0,
+            lead_score REAL,
+            score_reasons TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
 
@@ -141,6 +149,7 @@ class Lead:
     skip_reason: Optional[str] = None
     address: Optional[str] = None
     status: str = "not_called"
+    lead_score: Optional[float] = None
     id: Optional[int] = None
 
     @property

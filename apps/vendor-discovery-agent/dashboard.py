@@ -314,11 +314,13 @@ def api_campaigns():
 
         # Scheduled calls lookup: lead_id -> row
         sched_rows = conn.execute(
-            "SELECT * FROM scheduled_calls WHERE status='pending'"
+            "SELECT * FROM scheduled_calls WHERE status IN ('pending','in_progress') ORDER BY lead_id, scheduled_at"
         ).fetchall()
         sched_by_lead = {}
         for s in sched_rows:
-            sched_by_lead[s["lead_id"]] = s
+            # Keep earliest pending call per lead (query ordered by lead_id, scheduled_at)
+            if s["lead_id"] not in sched_by_lead:
+                sched_by_lead[s["lead_id"]] = s
 
         result = []
         for c in campaigns:

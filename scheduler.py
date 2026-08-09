@@ -311,7 +311,7 @@ def _fire(row) -> None:
                     except Exception as e_sms:
                         print(f"  [SMS] Fallback failed: {e_sms}")
 
-            else:  # negative / unknown
+            elif outcome == "negative":
                 with get_conn() as conn:
                     conn.execute("UPDATE leads SET status='negative' WHERE id=?", (lead_id,))
                     conn.execute(
@@ -322,7 +322,23 @@ def _fire(row) -> None:
                          json.dumps(inference) if inference else None)
                     )
                     conn.commit()
-                print(f"  [Scheduler] R1 retry {outcome} for lead {lead_id} — marked negative.")
+                print(f"  [Scheduler] R1 lead {lead_id} — marked negative.")
+
+            else:  # unknown — call completed but inconclusive; retry once like no_answer
+                retry_count = _get_retry_count(lead_id)
+                scheduled = schedule_retry(
+                    lead_id=lead_id, campaign_id=campaign_id, product=product,
+                    attempt=retry_count, lat=None, lon=None, tz_hint=tz_name,
+                    region=region, language=language,
+                )
+                if scheduled:
+                    _increment_retry_count(lead_id)
+                    print(f"  [Scheduler] R1 unknown outcome for lead {lead_id} — queued retry (attempt {retry_count}).")
+                else:
+                    with get_conn() as conn:
+                        conn.execute("UPDATE leads SET status='exhausted' WHERE id=?", (lead_id,))
+                        conn.commit()
+                    print(f"  [Scheduler] R1 unknown retries exhausted for lead {lead_id}.")
 
             _update_status(sched_id, "fired")
             return

@@ -104,9 +104,21 @@ def run_call(plan_id: str, confirm_token: str) -> dict:
 TERMINAL_STATUSES = {"COMPLETED","FAILED","NO_ANSWER","NO ANSWER","BUSY","CANCELLED","DECLINED",
                      "completed","failed","no_answer","no answer","busy","cancelled","declined"}
 
+_FETCH_RETRY_BUDGET = 3  # transient fetch-failed retries per poll cycle
+
 def poll_until_done(run_id: str, on_update=None) -> dict:
+    fetch_fails = 0
     for _ in range(MAX_POLLS):
-        status = _run(["call", "status", "--run-id", run_id])
+        try:
+            status = _run(["call", "status", "--run-id", run_id])
+            fetch_fails = 0  # reset on success
+        except RuntimeError as e:
+            if "fetch failed" in str(e).lower() and fetch_fails < _FETCH_RETRY_BUDGET:
+                fetch_fails += 1
+                print(f"  [Poll] Transient fetch error (attempt {fetch_fails}/{_FETCH_RETRY_BUDGET}), retrying...")
+                time.sleep(POLL_INTERVAL)
+                continue
+            raise  # exhaust budget or non-transient error
         _publish_live(run_id, {
             "type": "status",
             "status": status.get("status", ""),
@@ -144,6 +156,13 @@ def classify_round1(status_output: dict) -> str:
         return "no_answer"
     if call_status == "FAILED":
         return "failed"
+
+    # report_blocked = vendor requested callback; must be positive to trigger R2 scheduling
+    if status_output.get("callback_requested"):
+        return "positive"
+    next_step = status_output.get("next_step") or {}
+    if isinstance(next_step, dict) and next_step.get("action") == "report_blocked":
+        return "positive"
 
     # result.outcome.task_completed is the primary CALL-E signal
     result = status_output.get("result") or {}

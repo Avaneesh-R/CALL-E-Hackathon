@@ -1,0 +1,21 @@
+{
+  "name": "calle",
+  "version": "1.0.0",
+  "description": "Automatically discover local vendors via OpenStreetMap and conduct two-round AI phone outreach using CALL-E — without any manual research.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "allowScripts": {
+    "@whiskeysockets/baileys@7.0.0-rc14": true,
+    "protobufjs@7.6.5": true
+  }
+}

@@ -8,6 +8,8 @@ import time
 import subprocess
 import sys
 import concurrent.futures as _cf
+import queue as _queue
+import threading as _threading
 from pathlib import Path
 
 import os as _os
@@ -35,6 +37,34 @@ _CALLE_ENV = (
 )
 POLL_INTERVAL = 15
 MAX_POLLS = 40  # 10 minutes max per call
+
+
+# Live event streaming registry (run_id -> Queue)
+_live_lock = _threading.Lock()
+_LIVE_QUEUES: dict = {}
+
+def register_live_queue(run_id: str) -> _queue.Queue:
+    q = _queue.Queue(maxsize=100)
+    with _live_lock:
+        _LIVE_QUEUES[run_id] = q
+    return q
+
+def _publish_live(run_id: str, event: dict) -> None:
+    with _live_lock:
+        q = _LIVE_QUEUES.get(run_id)
+    if q:
+        try:
+            q.put_nowait(event)
+        except _queue.Full:
+            pass  # Drop if consumer is slow
+
+def unregister_live_queue(run_id: str) -> None:
+    with _live_lock:
+        _LIVE_QUEUES.pop(run_id, None)
+
+def active_live_runs() -> list:
+    with _live_lock:
+        return list(_LIVE_QUEUES.keys())
 
 
 def _call_groq(client, **kwargs):
@@ -74,14 +104,45 @@ def run_call(plan_id: str, confirm_token: str) -> dict:
 TERMINAL_STATUSES = {"COMPLETED","FAILED","NO_ANSWER","NO ANSWER","BUSY","CANCELLED","DECLINED",
                      "completed","failed","no_answer","no answer","busy","cancelled","declined"}
 
-def poll_until_done(run_id: str) -> dict:
+_FETCH_RETRY_BUDGET = 3  # transient fetch-failed retries per poll cycle
+
+def poll_until_done(run_id: str, on_update=None) -> dict:
+    fetch_fails = 0
     for _ in range(MAX_POLLS):
-        status = _run(["call", "status", "--run-id", run_id])
+        try:
+            status = _run(["call", "status", "--run-id", run_id])
+            fetch_fails = 0  # reset on success
+        except RuntimeError as e:
+            if "fetch failed" in str(e).lower() and fetch_fails < _FETCH_RETRY_BUDGET:
+                fetch_fails += 1
+                print(f"  [Poll] Transient fetch error (attempt {fetch_fails}/{_FETCH_RETRY_BUDGET}), retrying...")
+                time.sleep(POLL_INTERVAL)
+                continue
+            raise  # exhaust budget or non-transient error
+        _publish_live(run_id, {
+            "type": "status",
+            "status": status.get("status", ""),
+            "transcript": parse_transcript_to_json(status),
+            "summary": (status.get("result") or {}).get("summary", ""),
+        })
+        if on_update:
+            on_update(status)
         raw = status.get("status", "")
         if raw in TERMINAL_STATUSES or raw.upper().replace(" ", "_") in TERMINAL_STATUSES:
+            _publish_live(run_id, {"type": "done", "status": status.get("status", "")})
             return status
         time.sleep(POLL_INTERVAL)
-    return _run(["call", "status", "--run-id", run_id])
+    final_status = _run(["call", "status", "--run-id", run_id])
+    _publish_live(run_id, {
+        "type": "status",
+        "status": final_status.get("status", ""),
+        "transcript": parse_transcript_to_json(final_status),
+        "summary": (final_status.get("result") or {}).get("summary", ""),
+    })
+    if on_update:
+        on_update(final_status)
+    _publish_live(run_id, {"type": "done", "status": final_status.get("status", "")})
+    return final_status
 
 
 def classify_round1(status_output: dict) -> str:
@@ -95,6 +156,13 @@ def classify_round1(status_output: dict) -> str:
         return "no_answer"
     if call_status == "FAILED":
         return "failed"
+
+    # report_blocked = vendor requested callback; must be positive to trigger R2 scheduling
+    if status_output.get("callback_requested"):
+        return "positive"
+    next_step = status_output.get("next_step") or {}
+    if isinstance(next_step, dict) and next_step.get("action") == "report_blocked":
+        return "positive"
 
     # result.outcome.task_completed is the primary CALL-E signal
     result = status_output.get("result") or {}
@@ -219,7 +287,7 @@ def infer_from_transcript(transcript_lines: list[dict], product_description: str
     client = Groq(api_key=api_key)
     with _cf.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(_call_groq, client,
-                        model="llama-3.3-70b-versatile",
+                        model="groq/compound",
                         messages=[{"role": "user", "content": prompt}],
                         max_tokens=512, temperature=0.1)
         try:
@@ -283,7 +351,9 @@ def execute_call_pipeline(phone: str, goal: str, region: str = None, language: s
         raise RuntimeError(f"run_call did not return run_id: {run_result}")
 
     print(f"  Run ID: {run_id} — polling for completion...")
+    register_live_queue(run_id)
     final_status = poll_until_done(run_id)
+    unregister_live_queue(run_id)
     raw_status = (final_status.get("status") or "").upper().replace(" ", "_")
     print(f"  Done. Status: {raw_status}")
 

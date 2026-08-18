@@ -7,14 +7,12 @@ const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLat
 const qrcode  = require('qrcode-terminal');
 const http    = require('http');
 const path    = require('path');
-const fs      = require('fs');
 
 const PORT     = 3001;
 const AUTH_DIR = path.join(__dirname, 'wa_auth');
 
 let sock = null;
 let ready = false;
-const inbox = []; // stores last 50 incoming messages
 
 async function connect() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -28,21 +26,6 @@ async function connect() {
     });
 
     sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('messages.upsert', ({ messages }) => {
-        for (const msg of messages) {
-            if (msg.key.fromMe) continue;
-            const from = msg.key.remoteJid;
-            const text = msg.message?.conversation
-                || msg.message?.extendedTextMessage?.text
-                || msg.message?.reactionMessage?.text
-                || '[media/sticker/reaction]';
-            const entry = { from, text, time: new Date().toISOString() };
-            inbox.unshift(entry);
-            if (inbox.length > 50) inbox.pop();
-            console.log(`  ← [${from}]: ${text}`);
-        }
-    });
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -89,14 +72,6 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (req.method === 'GET' && req.url.startsWith('/inbox')) {
-        const params = new URL(req.url, 'http://localhost').searchParams;
-        const from = params.get('from');
-        const msgs = from ? inbox.filter(m => m.from.includes(from)) : inbox;
-        res.end(JSON.stringify(msgs));
-        return;
-    }
-
     if (req.method === 'POST' && req.url === '/send') {
         if (!ready) {
             res.statusCode = 503;
@@ -112,32 +87,6 @@ const server = http.createServer(async (req, res) => {
                 const jid = toJid(phone);
                 await sock.sendMessage(jid, { text: message });
                 console.log(`  ✓ Sent to ${phone}: ${message.slice(0, 60)}`);
-                res.end(JSON.stringify({ ok: true, jid }));
-            } catch (e) {
-                res.statusCode = 500;
-                res.end(JSON.stringify({ ok: false, error: e.message }));
-            }
-        });
-        return;
-    }
-
-    if (req.method === 'POST' && req.url === '/send-sticker') {
-        if (!ready) {
-            res.statusCode = 503;
-            res.end(JSON.stringify({ ok: false, error: 'WhatsApp not connected yet — scan QR first' }));
-            return;
-        }
-        let body = '';
-        req.on('data', d => body += d);
-        req.on('end', async () => {
-            try {
-                const { phone, file_path } = JSON.parse(body);
-                if (!phone || !file_path) throw new Error('phone and file_path required');
-                if (!fs.existsSync(file_path)) throw new Error('file not found: ' + file_path);
-                const jid = toJid(phone);
-                const stickerBuffer = fs.readFileSync(file_path);
-                await sock.sendMessage(jid, { sticker: stickerBuffer });
-                console.log(`  ✓ Sticker sent to ${phone}`);
                 res.end(JSON.stringify({ ok: true, jid }));
             } catch (e) {
                 res.statusCode = 500;

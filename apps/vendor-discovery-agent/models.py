@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sqlite3
 import json
 from dataclasses import dataclass, field
@@ -96,6 +98,28 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER REFERENCES leads(id),
+            campaign_id INTEGER REFERENCES campaigns(id),
+            phone TEXT,
+            body TEXT,
+            provider TEXT DEFAULT 'mock',
+            status TEXT DEFAULT 'sent',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            goal_script TEXT,
+            persona_name TEXT,
+            persona_tone TEXT DEFAULT 'professional',
+            region TEXT,
+            language TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_scheduled_status_at
         ON scheduled_calls(status, scheduled_at);
         """)
@@ -134,6 +158,35 @@ class Campaign:
             )
             self.id = cur.lastrowid
         return self
+
+
+def save_template(name: str, goal_script: str = None, persona_name: str = None,
+                  persona_tone: str = "professional", region: str = None,
+                  language: str = None) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO templates (name, goal_script, persona_name, persona_tone, region, language)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(name) DO UPDATE SET
+               goal_script=excluded.goal_script, persona_name=excluded.persona_name,
+               persona_tone=excluded.persona_tone, region=excluded.region,
+               language=excluded.language""",
+            (name, goal_script, persona_name, persona_tone, region, language)
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def load_template(name: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM templates WHERE name=?", (name,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_templates() -> list:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM templates ORDER BY name").fetchall()
+        return [dict(r) for r in rows]
 
 
 @dataclass

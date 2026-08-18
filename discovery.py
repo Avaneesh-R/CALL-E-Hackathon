@@ -12,43 +12,6 @@ import urllib.parse
 from typing import Optional
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-
-# (south, west, north, east) bounding boxes for common Indian cities — avoids Nominatim calls
-_CITY_BBOX_CACHE: dict = {
-    "delhi": (28.40, 76.84, 28.88, 77.35),
-    "new delhi": (28.40, 76.84, 28.88, 77.35),
-    "connaught place": (28.58, 77.17, 28.70, 77.28),
-    "connaught place, delhi": (28.58, 77.17, 28.70, 77.28),
-    "chandni chowk": (28.60, 77.18, 28.72, 77.30),
-    "chandni chowk, delhi": (28.60, 77.18, 28.72, 77.30),
-    "mumbai": (18.87, 72.77, 19.27, 72.99),
-    "bangalore": (12.83, 77.46, 13.14, 77.78),
-    "bengaluru": (12.83, 77.46, 13.14, 77.78),
-    "hyderabad": (17.27, 78.27, 17.57, 78.67),
-    "chennai": (12.90, 80.12, 13.23, 80.33),
-    "kolkata": (22.45, 88.24, 22.70, 88.47),
-    "pune": (18.42, 73.74, 18.64, 73.99),
-    "ahmedabad": (22.93, 72.47, 23.12, 72.72),
-    "jaipur": (26.82, 75.73, 26.97, 75.91),
-    "lucknow": (26.78, 80.86, 26.95, 81.05),
-    "surat": (21.10, 72.78, 21.28, 72.95),
-    "kanpur": (26.39, 80.24, 26.53, 80.43),
-    "nagpur": (21.07, 78.96, 21.23, 79.17),
-    "noida": (28.48, 77.31, 28.64, 77.51),
-    "gurugram": (28.38, 76.99, 28.52, 77.12),
-    "gurgaon": (28.38, 76.99, 28.52, 77.12),
-    "chandigarh": (30.66, 76.72, 30.79, 76.87),
-    "bhopal": (23.16, 77.31, 23.30, 77.50),
-    "indore": (22.63, 75.76, 22.78, 75.93),
-    "patna": (25.55, 85.05, 25.65, 85.22),
-    "vadodara": (22.25, 73.11, 22.38, 73.26),
-    "coimbatore": (10.94, 76.90, 11.07, 77.07),
-    "kochi": (9.91, 76.21, 10.06, 76.36),
-    "vizag": (17.64, 83.18, 17.79, 83.36),
-    "visakhapatnam": (17.64, 83.18, 17.79, 83.36),
-}
-# Runtime geocoding cache (session-level, avoids re-calling Nominatim for same location)
-_geocode_runtime_cache: dict = {}
 OVERPASS_SERVERS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -146,38 +109,17 @@ MIN_BBOX_DEGREES = 0.02  # ~2km; expand if Nominatim returns a point/tiny bbox
 
 def geocode_location(location: str) -> tuple[float, float, float, float]:
     """Returns (south, west, north, east) bounding box for location string."""
-    import urllib.error as _ue
-    key = location.lower().strip()
-
-    # 1. Static city cache (no network needed)
-    if key in _CITY_BBOX_CACHE:
-        return _CITY_BBOX_CACHE[key]
-    # Check if any known city name appears in the location string
-    for city_key, bbox in _CITY_BBOX_CACHE.items():
-        if city_key in key:
-            return bbox
-
-    # 2. Runtime session cache
-    if key in _geocode_runtime_cache:
-        return _geocode_runtime_cache[key]
-
-    # 3. Nominatim API with retry backoff
-    params = urllib.parse.urlencode({"q": location, "format": "json", "limit": 1})
-    data = None
-    for attempt in range(3):
-        req = urllib.request.Request(
-            f"{NOMINATIM_URL}?{params}",
-            headers={"User-Agent": USER_AGENT}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-            break
-        except _ue.HTTPError as e:
-            if e.code == 429 and attempt < 2:
-                time.sleep(15 * (attempt + 1))
-                continue
-            raise
+    params = urllib.parse.urlencode({
+        "q": location,
+        "format": "json",
+        "limit": 1,
+    })
+    req = urllib.request.Request(
+        f"{NOMINATIM_URL}?{params}",
+        headers={"User-Agent": USER_AGENT}
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
     if not data:
         raise ValueError(f"Could not geocode location: {location!r}")
     result = data[0]
@@ -189,9 +131,7 @@ def geocode_location(location: str) -> tuple[float, float, float, float]:
         lon = (w + e) / 2
         half = MIN_BBOX_DEGREES / 2
         s, n, w, e = lat - half, lat + half, lon - half, lon + half
-    bbox = (s, w, n, e)
-    _geocode_runtime_cache[key] = bbox
-    return bbox
+    return s, w, n, e
 
 
 def _build_overpass_query(tags: list[tuple[str, str]], bbox: tuple, limit: int) -> str:
@@ -266,22 +206,6 @@ def _run_overpass(query: str) -> list[dict]:
                 result = json.loads(resp.read())
             return result.get("elements", [])
         except urllib.error.HTTPError as e:
-            if e.code == 429:
-                # Rate limited — wait 65s then retry this server once
-                print(f"  [Overpass] 429 from {server}, waiting 65s...")
-                time.sleep(65)
-                try:
-                    req2 = urllib.request.Request(
-                        server, data=data,
-                        headers={"User-Agent": USER_AGENT,
-                                 "Content-Type": "application/x-www-form-urlencoded"}
-                    )
-                    with urllib.request.urlopen(req2, timeout=90) as resp:
-                        result = json.loads(resp.read())
-                    return result.get("elements", [])
-                except Exception as e2:
-                    last_err = e2
-                    continue
             if e.code == 504:
                 last_err = e
                 time.sleep(3)

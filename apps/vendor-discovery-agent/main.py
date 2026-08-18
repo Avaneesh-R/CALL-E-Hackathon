@@ -201,7 +201,8 @@ def run_campaign(product: str, location: str, limit: int,
                  region: str, language: str, dry_run: bool, yes: bool = False,
                  export: str = None, skip_hours_gate: bool = False,
                  export_csv_path: str = None, export_json_path: str = None,
-                 persona_name: str = None, persona_tone: str = "professional"):
+                 persona_name: str = None, persona_tone: str = "professional",
+                 template_goal: str = None, save_template_name: str = None):
     init_db()
 
     print(f"\nVendor Discovery & Outreach")
@@ -282,8 +283,23 @@ def run_campaign(product: str, location: str, limit: int,
         return
 
     # Generate and get approval for round-1 script
-    r1_goal = _call_generate_goal(product, round_num=1, persona_name=persona_name, persona_tone=persona_tone)
-    r1_goal = r1_goal if yes else prompt_client_approval(r1_goal, round_num=1)
+    if template_goal:
+        r1_goal = template_goal
+        print(f"  [Template] Using saved goal script.")
+    else:
+        r1_goal = _call_generate_goal(product, round_num=1, persona_name=persona_name, persona_tone=persona_tone)
+        r1_goal = r1_goal if yes else prompt_client_approval(r1_goal, round_num=1)
+
+    # Save the approved R1 goal as a template if requested
+    if save_template_name:
+        try:
+            from models import save_template
+            save_template(name=save_template_name, goal_script=r1_goal,
+                          region=region, language=language,
+                          persona_name=persona_name, persona_tone=persona_tone)
+            print(f"  [Template] Saved goal script as '{save_template_name}'.")
+        except Exception as e_tpl:
+            print(f"  [Template] Could not save template: {e_tpl}")
 
     with get_conn() as conn:
         conn.execute("UPDATE campaigns SET goal_script=? WHERE id=?", (r1_goal, campaign_id))
@@ -391,6 +407,12 @@ def run_campaign(product: str, location: str, limit: int,
         with get_conn() as conn:
             print_results_table(conn, campaign_id)
         _run_exports(campaign_id, export, export_csv_path, export_json_path)
+        # Send email report if configured
+        try:
+            from reporting import send_report_email
+            send_report_email(campaign_id, excel_path=export)
+        except Exception as e_rep:
+            print(f"[Report] Email skipped: {e_rep}")
         return
 
     if uncertain:
@@ -445,6 +467,13 @@ def run_campaign(product: str, location: str, limit: int,
 
     _run_exports(campaign_id, export, export_csv_path, export_json_path)
 
+    # Send email report if configured
+    try:
+        from reporting import send_report_email
+        send_report_email(campaign_id, excel_path=export)
+    except Exception as e_rep:
+        print(f"[Report] Email skipped: {e_rep}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Vendor Discovery & Outreach via CALL-E + OSM")
@@ -468,22 +497,52 @@ def main():
     parser.add_argument("--persona-tone", default="professional",
                         choices=["professional", "friendly", "energetic"],
                         help="Caller persona tone (default professional)")
+    parser.add_argument("--template", default=None, metavar="NAME",
+                        help="Load a saved campaign template by name")
+    parser.add_argument("--save-template", default=None, metavar="NAME",
+                        help="Save the approved R1 goal as a named template after approval")
     args = parser.parse_args()
+
+    template_goal = None
+    region = args.region
+    language = args.language
+    persona_name = args.persona_name
+    persona_tone = args.persona_tone
+
+    if args.template:
+        from models import load_template
+        tpl = load_template(args.template)
+        if tpl:
+            print(f"[Template] Loaded template '{args.template}'.")
+            # CLI args override template values only if explicitly set
+            if region is None:
+                region = tpl.get("region")
+            if language is None:
+                language = tpl.get("language")
+            if persona_name is None:
+                persona_name = tpl.get("persona_name")
+            if persona_tone == "professional" and tpl.get("persona_tone"):
+                persona_tone = tpl.get("persona_tone")
+            template_goal = tpl.get("goal_script")
+        else:
+            print(f"[Template] No template named '{args.template}' found; generating goal normally.")
 
     run_campaign(
         product=args.product,
         location=args.location,
         limit=args.limit,
-        region=args.region,
-        language=args.language,
+        region=region,
+        language=language,
         dry_run=args.dry_run,
         yes=args.yes,
         export=args.export_excel,
         skip_hours_gate=args.skip_hours_gate,
         export_csv_path=args.export_csv,
         export_json_path=args.export_json,
-        persona_name=args.persona_name,
-        persona_tone=args.persona_tone,
+        persona_name=persona_name,
+        persona_tone=persona_tone,
+        template_goal=template_goal,
+        save_template_name=args.save_template,
     )
 
 

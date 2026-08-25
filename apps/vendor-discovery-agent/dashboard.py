@@ -303,6 +303,20 @@ pre.json-view{font-family:monospace;font-size:.76rem;color:#c9d1d9;white-space:p
 .bench-card{background:linear-gradient(180deg,rgba(20,22,38,.82),rgba(13,15,26,.85));backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid var(--border);border-radius:18px;padding:20px;box-shadow:0 1px 0 rgba(255,255,255,.04) inset,0 20px 44px -30px rgba(0,0,0,.9)}
 .bench-card h3{font-size:.95rem;color:var(--txt-bright);margin-bottom:14px;font-weight:700;letter-spacing:-.015em}
 #map-view .campaign{margin-bottom:0}
+#map-view{position:relative;border-radius:16px;overflow:hidden;border:1px solid var(--border);box-shadow:0 20px 44px -30px rgba(0,0,0,.9)}
+.leaflet-popup-content-wrapper{background:rgba(18,20,34,0.97);border:1px solid rgba(255,255,255,0.08);border-radius:12px;color:#c7ccd6;box-shadow:0 20px 60px rgba(0,0,0,0.8)}
+.leaflet-popup-tip{background:rgba(18,20,34,0.97)}
+.leaflet-popup-close-button{color:#8b92a6!important}
+.leaflet-popup-close-button:hover{color:#ff6b64!important}
+/* Map filter bar */
+.map-filter-bar{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:600;display:flex;gap:6px;background:rgba(12,13,22,0.95);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:5px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);box-shadow:0 12px 30px -12px rgba(0,0,0,.8)}
+.map-filter-btn{font-size:.7rem;font-weight:600;color:#9aa1b3;background:transparent;border:none;border-radius:7px;padding:5px 11px;cursor:pointer;font-family:inherit;transition:all .15s}
+.map-filter-btn:hover{color:#e6e9f0;background:rgba(255,255,255,.05)}
+.map-filter-btn.active{color:#fff;background:linear-gradient(135deg,var(--accent),var(--accent-2))}
+/* Map stats overlay */
+.map-stats-ctrl{background:rgba(12,13,22,0.95)!important;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px 13px;font-size:11px;line-height:1.7;color:#c7ccd6;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);box-shadow:0 12px 30px -12px rgba(0,0,0,.8)}
+.map-stats-ctrl .mst-title{font-weight:700;color:#c7d2fe;margin-bottom:3px}
+.map-stats-ctrl .mst-row{display:flex;gap:10px;flex-wrap:wrap}
 
 /* ══════════ LIVE CONSOLE — TERMINAL ══════════ */
 .live-term-head{display:flex;align-items:center;gap:9px;background:#0b0c12;border:1px solid var(--border);border-bottom:none;border-radius:12px 12px 0 0;padding:9px 14px;font-family:'JetBrains Mono',monospace;font-size:.7rem;letter-spacing:.12em;font-weight:600;color:#8b92a6}
@@ -474,6 +488,14 @@ pre.json-view{font-family:monospace;font-size:.76rem;color:#c9d1d9;white-space:p
 .consent-ok::before{content:'';width:6px;height:6px;border-radius:50%;background:#67e08a;box-shadow:0 0 8px rgba(86,211,100,.8)}
 .consent-no{font-size:.66rem;padding:3px 10px;border-radius:20px;background:rgba(248,81,73,.12);color:#ff6b64;border:1px solid rgba(248,81,73,.3);font-weight:600;display:inline-flex;align-items:center;gap:6px}
 .consent-no::before{content:'';width:6px;height:6px;border-radius:50%;background:#ff6b64;box-shadow:0 0 8px rgba(248,81,73,.8)}
+.consent-approve-btn {
+  font-size:.68rem; padding:5px 14px; border-radius:20px;
+  background:linear-gradient(135deg,#22c55e,#16a34a);
+  border:none; color:#fff; cursor:pointer; font-weight:600;
+  font-family:inherit; transition:transform .15s, box-shadow .15s;
+  box-shadow:0 4px 12px -4px rgba(34,197,94,.5);
+}
+.consent-approve-btn:hover { transform:translateY(-1px); box-shadow:0 8px 18px -4px rgba(34,197,94,.6); }
 
 /* TABLE */
 table{width:100%;border-collapse:separate;border-spacing:0;font-size:.82rem}
@@ -806,7 +828,7 @@ tbody tr.lead-row:hover{background:linear-gradient(90deg,rgba(99,102,241,.08),rg
   </div>
 </div>
 
-<div id="map-view" class="view" style="height:500px"></div>
+<div id="map-view" class="view" style="height:calc(100vh - 120px);min-height:400px"></div>
 
 <div id="live-view" class="view">
   <div class="live-term-head">
@@ -834,6 +856,8 @@ let _activeTab = 'leads';
 const _charts = {};
 let _map = null;
 let _mapMarkers = [];
+let _mapFilter = 'all';       // all | positive | negative | no_answer | not_called
+let _mapStatsCtrl = null;     // Leaflet control for live stats overlay
 
 const _PAGE_TITLES = {leads:'Leads', analytics:'Analytics', map:'Map', live:'Live Console'};
 function switchTab(name){
@@ -845,7 +869,7 @@ function switchTab(name){
   const pt = document.getElementById('page-title');
   if(pt) pt.textContent = _PAGE_TITLES[name] || name;
   if(name==='analytics') renderAnalytics(_lastData);
-  if(name==='map') renderMap(_lastData);
+  if(name==='map'){ renderMap(_lastData); setTimeout(()=>{ if(_map) _map.invalidateSize(); }, 420); }
 }
 
 // Campaign filter pills (All / Active / Completed)
@@ -949,12 +973,54 @@ function renderBenchmark(data){
       <td>${escHtml(r.interest)}</td></tr>`).join('')}</tbody></table>`;
 }
 
+// Statuses where a human actually picked up the phone
+const MAP_ANSWERED = new Set(['positive','negative','unknown','completed']);
+const MAP_COLOR = {
+  positive: '#56d364',
+  negative: '#f85149',
+  unknown:  '#bc8cff',
+  completed:'#58a6ff',
+  no_answer:'#e3b341',
+  busy:     '#e3b341',
+  failed:   '#666',
+  skipped:  '#555',
+};
+
+// Bucket a lead's status into the filter categories
+function mapFilterBucket(status){
+  if(status==='positive') return 'positive';
+  if(status==='negative') return 'negative';
+  if(status==='no_answer' || status==='busy' || status==='failed') return 'no_answer';
+  if(status==='not_called' || status==='skipped' || !status) return 'not_called';
+  return 'other'; // completed / unknown -> answered but uncategorised
+}
+
+function setMapFilter(mode){
+  _mapFilter = mode;
+  renderMap(_lastData);
+}
+
 function renderMap(data){
   const pts = [];
   data.forEach(c=>c.leads.forEach(l=>{
     if(l.lat!==null && l.lat!==undefined && l.lon!==null && l.lon!==undefined)
       pts.push({...l, _campaign: c.product_description});
   }));
+
+  // Empty state — only when the map has never been initialised
+  if(pts.length === 0 && !_map){
+    document.getElementById('map-view').innerHTML = '<div style="height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:#6b7280"><div style="font-size:2rem">🗺️</div><div style="font-weight:600;color:#9aa1b3">No mapped leads yet</div><div style="font-size:.8rem">Discover vendors to see them appear here</div></div>';
+    return;
+  }
+
+  // De-dupe overlapping coordinates: jitter any point sharing a ~0.001° cell
+  const seen = {};
+  pts.forEach(l=>{
+    const key = `${l.lat.toFixed(3)},${l.lon.toFixed(3)}`;
+    if(seen[key]){ l.lat += (Math.random()-.5)*0.001; l.lon += (Math.random()-.5)*0.001; }
+    else seen[key] = true;
+  });
+
   if(!_map){
     const clat = pts.length ? pts.reduce((s,l)=>s+l.lat,0)/pts.length : 20.5937;
     const clon = pts.length ? pts.reduce((s,l)=>s+l.lon,0)/pts.length : 78.9629;
@@ -963,13 +1029,13 @@ function renderMap(data){
       attribution:'&copy; <a href="https://openstreetmap.org/copyright">OpenStreetMap contributors</a>'
     }).addTo(_map);
 
-    // Legend
+    // Legend (dark theme)
     const legend = L.control({position:'bottomright'});
     legend.onAdd = function(){
       const d = L.DomUtil.create('div');
-      d.style.cssText = 'background:#161b22;color:#c9d1d9;padding:10px 14px;border-radius:6px;font-size:11px;line-height:1.8;border:1px solid #30363d';
+      d.style.cssText = 'background:rgba(12,13,22,0.95);color:#c7ccd6;padding:10px 14px;border-radius:10px;font-size:11px;line-height:1.8;border:1px solid rgba(255,255,255,0.08);box-shadow:0 12px 30px -12px rgba(0,0,0,.8)';
       d.innerHTML = [
-        '<b style="color:#58a6ff">Map Legend</b>',
+        '<b style="color:#a5b4fc">Map Legend</b>',
         '<div style="margin-top:4px"><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#56d364;border:2px solid #fff;margin-right:6px;vertical-align:middle"></span>Answered &mdash; positive</div>',
         '<div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#f85149;border:2px solid #fff;margin-right:6px;vertical-align:middle"></span>Answered &mdash; negative</div>',
         '<div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#bc8cff;border:2px solid #fff;margin-right:6px;vertical-align:middle"></span>Answered &mdash; inconclusive</div>',
@@ -979,23 +1045,35 @@ function renderMap(data){
       return d;
     };
     legend.addTo(_map);
+
+    // Live stats overlay (top-left)
+    _mapStatsCtrl = L.control({position:'topleft'});
+    _mapStatsCtrl.onAdd = function(){
+      const d = L.DomUtil.create('div', 'map-stats-ctrl');
+      d.id = 'map-stats-box';
+      return d;
+    };
+    _mapStatsCtrl.addTo(_map);
   }
+
+  // Filter bar (injected once into the map container)
+  if(!document.getElementById('map-filter-bar')){
+    const bar = document.createElement('div');
+    bar.className = 'map-filter-bar';
+    bar.id = 'map-filter-bar';
+    const opts = [['all','All'],['positive','Positive'],['negative','Negative'],['no_answer','No Answer'],['not_called','Not Called']];
+    bar.innerHTML = opts.map(([k,lbl])=>`<button class="map-filter-btn" data-f="${k}" onclick="setMapFilter('${k}')">${lbl}</button>`).join('');
+    document.getElementById('map-view').appendChild(bar);
+  }
+  document.querySelectorAll('#map-filter-bar .map-filter-btn').forEach(b=>{
+    b.classList.toggle('active', b.dataset.f===_mapFilter);
+  });
 
   _mapMarkers.forEach(m=>_map.removeLayer(m));
   _mapMarkers = [];
 
-  // Statuses where a human actually picked up the phone
-  const ANSWERED = new Set(['positive','negative','unknown','completed']);
-  const COLOR = {
-    positive: '#56d364',
-    negative: '#f85149',
-    unknown:  '#bc8cff',
-    completed:'#58a6ff',
-    no_answer:'#e3b341',
-    busy:     '#e3b341',
-    failed:   '#666',
-    skipped:  '#555',
-  };
+  const ANSWERED = MAP_ANSWERED;
+  const COLOR = MAP_COLOR;
 
   // Draw not-answered first (bottom layer), answered on top
   const [notAnswered, answered] = pts.reduce(([n,a],l)=>
@@ -1005,10 +1083,14 @@ function renderMap(data){
     const wasAnswered = ANSWERED.has(l.r1_status);
     const col = COLOR[l.r1_status] || '#8b949e';
 
+    // Filter dimming: markers not matching the active filter fade to 0.2
+    const inFilter = (_mapFilter==='all') || (mapFilterBucket(l.r1_status)===_mapFilter);
+    const dim = inFilter ? 1 : 0.2;
+
     // Outer pulse ring for answered calls
     if(wasAnswered){
       const ring = L.circleMarker([l.lat,l.lon], {
-        radius:16, color:col, fillColor:col, fillOpacity:.12, weight:1.5,
+        radius:16, color:col, fillColor:col, fillOpacity:.12*dim, opacity:dim, weight:1.5,
         interactive:false
       });
       ring.addTo(_map);
@@ -1019,50 +1101,68 @@ function renderMap(data){
       radius:     wasAnswered ? 10 : 6,
       color:      wasAnswered ? '#ffffff' : col,
       fillColor:  col,
-      fillOpacity:wasAnswered ? 0.92 : 0.45,
+      fillOpacity:(wasAnswered ? 0.92 : 0.45)*dim,
+      opacity:    dim,
       weight:     wasAnswered ? 2.5 : 1,
     });
 
-    // Build popup
-    const statusLabel = wasAnswered
-      ? `<span style="color:${col};font-weight:600">${l.r1_status} (answered)</span>`
-      : `<span style="color:#8b949e">${l.r1_status||'not called'}</span>`;
+    // Build popup — Inter font, design-system colours
+    const statusBadge = wasAnswered
+      ? `<span style="display:inline-block;padding:2px 9px;border-radius:20px;font-size:.66rem;font-weight:600;background:${col}22;color:${col};border:1px solid ${col}55">${escHtml(l.r1_status)} · answered</span>`
+      : `<span style="display:inline-block;padding:2px 9px;border-radius:20px;font-size:.66rem;font-weight:600;background:rgba(139,146,166,.12);color:#9aa1b3;border:1px solid rgba(139,146,166,.25)">${escHtml(l.r1_status||'not called')}</span>`;
 
-    let transcriptSnip = '';
+    let inferenceBlock = '';
+    if(wasAnswered && l.r1_inference){
+      const inf = l.r1_inference;
+      const parts = [];
+      if(inf.interest_level) parts.push(`Interest: <b style="color:#c7d2fe">${escHtml(inf.interest_level)}</b>`);
+      if(inf.sentiment)      parts.push(`Sentiment: <b style="color:#c7d2fe">${escHtml(inf.sentiment)}</b>`);
+      if(parts.length) inferenceBlock += `<div style="font-size:.72rem;color:#9aa1b3;margin-bottom:4px">${parts.join(' · ')}</div>`;
+      if(inf.summary) inferenceBlock += `<div style="font-size:.72rem;color:#8b92a6;font-style:italic;margin-bottom:4px">${escHtml(String(inf.summary).slice(0,120))}</div>`;
+    }
+
+    let transcriptBlock = '';
     if(wasAnswered && l.transcript && l.transcript.length){
       const userLines = l.transcript.filter(x=>x.speaker&&x.speaker.toUpperCase()==='USER');
       if(userLines.length){
         const snippet = userLines.slice(0,2).map(x=>x.text).join(' / ').slice(0,120);
-        transcriptSnip = `<div style="margin-top:6px;padding:5px 7px;background:#0d1117;border-left:3px solid ${col};font-size:11px;color:#c9d1d9;border-radius:2px">"${escHtml(snippet)}"</div>`;
+        transcriptBlock = `<div style="margin-top:6px;padding:6px 9px;background:rgba(8,9,15,.6);border-left:3px solid ${col};font-size:.72rem;color:#c7ccd6;border-radius:6px">"${escHtml(snippet)}"</div>`;
       }
     }
 
-    let inferSnip = '';
-    if(wasAnswered && l.r1_inference){
-      const inf = l.r1_inference;
-      const parts = [];
-      if(inf.interest_level) parts.push(`Interest: <b>${escHtml(inf.interest_level)}</b>`);
-      if(inf.sentiment)      parts.push(`Sentiment: <b>${escHtml(inf.sentiment)}</b>`);
-      if(inf.summary)        parts.push(`<i>${escHtml(String(inf.summary).slice(0,100))}</i>`);
-      if(parts.length) inferSnip = `<div style="margin-top:5px;font-size:11px;color:#8b949e">${parts.join(' &bull; ')}</div>`;
-    }
+    const addressBlock = l.address
+      ? `<div style="font-size:.66rem;color:#6b7280;margin-top:6px">${escHtml(l.address)}</div>` : '';
 
     m.bindPopup(`
-      <div style="min-width:200px;max-width:280px;font-family:monospace">
-        <div style="font-size:13px;font-weight:700;color:#c9d1d9;margin-bottom:4px">${escHtml(l.name||'Unknown')}</div>
-        <div style="font-size:11px;color:#8b949e">${escHtml(l.category||'')} &bull; ${escHtml(l._campaign||'')}</div>
-        <div style="margin-top:4px">${statusLabel}</div>
-        ${transcriptSnip}
-        ${inferSnip}
-        ${l.address?`<div style="font-size:10px;color:#555;margin-top:4px">${escHtml(l.address)}</div>`:''}
+      <div style="font-family:'Inter',sans-serif;min-width:220px;max-width:300px">
+        <div style="font-size:.9rem;font-weight:700;color:#f0f3fa;margin-bottom:2px">${escHtml(l.name||'Unknown')}</div>
+        <div style="font-size:.72rem;color:#6b7280;margin-bottom:6px">${escHtml(l.category||'')} · ${escHtml(l._campaign||'')}</div>
+        <div style="margin-bottom:6px">${statusBadge}</div>
+        ${inferenceBlock}
+        ${transcriptBlock}
+        ${addressBlock}
       </div>
-    `, {maxWidth:300});
+    `, {maxWidth:320});
 
     m.addTo(_map);
     _mapMarkers.push(m);
   });
 
-  setTimeout(()=>_map.invalidateSize(), 50);
+  // Live stats overlay content
+  const box = document.getElementById('map-stats-box');
+  if(box){
+    let pos=0,neg=0,na=0;
+    pts.forEach(l=>{
+      const b = mapFilterBucket(l.r1_status);
+      if(b==='positive') pos++; else if(b==='negative') neg++; else if(b==='no_answer') na++;
+    });
+    box.innerHTML = `<div class="mst-title">📍 ${pts.length} vendors mapped</div>`
+      + `<div class="mst-row"><span style="color:#67e08a">✅ ${pos} positive</span>`
+      + `<span style="color:#ff6b64">❌ ${neg} negative</span>`
+      + `<span style="color:#e9c46a">📞 ${na} no answer</span></div>`;
+  }
+
+  setTimeout(()=>_map.invalidateSize(), 420);
 }
 function badge(s){ return `<span class="status ${SC[s]||'s-not_called'}">${s||'?'}</span>`; }
 function trunc(s,n){ return s&&s.length>n?s.slice(0,n)+'...':s||''; }
@@ -1327,6 +1427,9 @@ async function load(){
           ${c.consent_approved_at
             ? `<span class="consent-ok">&#10003; Consent</span>`
             : '<span class="consent-no">&#10007; No gate</span>'}
+          ${!c.consent_approved_at
+            ? `<button class="consent-approve-btn" onclick="approveCampaign(${c.id})">&#9654; Give Consent &amp; Call</button>`
+            : ''}
         </div>
       </div>
       <table>
@@ -1754,6 +1857,27 @@ function callieToast(msg){
   setTimeout(()=>{t.style.transition='opacity .3s';t.style.opacity='0';setTimeout(()=>t.remove(),300);},2500);
 }
 
+async function approveCampaign(campId){
+  try{
+    const res = await fetch(`/api/campaign/${campId}/approve`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({})
+    });
+    const j = await res.json();
+    if(!res.ok || !j.ok){
+      callieToast(j.message || 'Could not approve campaign');
+      return;
+    }
+  }catch(e){
+    callieToast('Approve failed: '+e);
+    return;
+  }
+  callieToast('Campaign approved — calling pipeline started!');
+  switchTab('live');
+  if(typeof load==='function') load();
+}
+
 // Pulse orb periodically when closed; cleared once user opens Callie
 const _callieOrb = document.getElementById('callie-orb');
 const _calliePulseTimer = setInterval(()=>{
@@ -1891,6 +2015,11 @@ def api_campaigns():
             if s["lead_id"] not in sched_by_lead:
                 sched_by_lead[s["lead_id"]] = s
 
+        # Cap synchronous Nominatim geocodes per request. Each lookup is a blocking
+        # HTTP call (up to ~5s); without a budget an uncached campaign would stall the
+        # /api/campaigns endpoint for many seconds on every 8s poll (N+1 network calls).
+        _geocode_budget = 3
+
         result = []
         for c in campaigns:
             leads_raw = conn.execute(
@@ -1965,9 +2094,12 @@ def api_campaigns():
                     except Exception:
                         sched_local = sc["scheduled_at"][:16]
 
-                # Lazy geocode: if lead has no coords but was called, try Nominatim once
+                # Lazy geocode: if lead has no coords but was called, try Nominatim once.
+                # Bounded by _geocode_budget so a single request can't stall on many
+                # blocking HTTP lookups (see budget note above the campaigns loop).
                 lead_lat, lead_lon = l["lat"], l["lon"]
-                if (lead_lat is None) and l["status"] not in ("not_called", "skipped") and l["name"]:
+                if (lead_lat is None) and _geocode_budget > 0 and l["status"] not in ("not_called", "skipped") and l["name"]:
+                    _geocode_budget -= 1
                     try:
                         import urllib.request as _ur, urllib.parse as _up
                         _q = _up.urlencode({"q": f"{l['name']}, {c['location']}", "format": "json", "limit": 1})
@@ -2118,8 +2250,26 @@ def api_templates_post():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+_running_campaigns: set = set()
+_running_campaigns_lock = __import__("threading").Lock()
+
 def _run_pipeline_bg(campaign_id: int, language: str, region: str):
-    """Background thread: score → call all leads for a campaign."""
+    """Background thread: call not_called leads for a campaign. Guards against duplicate threads."""
+    import threading, json as _json
+    with _running_campaigns_lock:
+        if campaign_id in _running_campaigns:
+            print(f"[Pipeline] Campaign #{campaign_id} already running — skipping duplicate start.")
+            return
+        _running_campaigns.add(campaign_id)
+    try:
+        _run_pipeline_bg_inner(campaign_id, language, region)
+    finally:
+        with _running_campaigns_lock:
+            _running_campaigns.discard(campaign_id)
+
+
+def _run_pipeline_bg_inner(campaign_id: int, language: str, region: str):
+    """Inner pipeline logic."""
     import threading, json as _json
     from datetime import datetime, timezone
 
@@ -2137,7 +2287,7 @@ def _run_pipeline_bg(campaign_id: int, language: str, region: str):
                 return
             product = camp["product_description"]
             leads = conn.execute(
-                "SELECT * FROM leads WHERE campaign_id=? ORDER BY lead_score DESC",
+                "SELECT * FROM leads WHERE campaign_id=? AND status='not_called' ORDER BY lead_score DESC",
                 (campaign_id,)
             ).fetchall()
 
@@ -2377,6 +2527,44 @@ def api_campaign_start(campaign_id):
     return jsonify({"started": True, "campaign_id": campaign_id})
 
 
+@app.route("/api/campaign/<int:camp_id>/approve", methods=["POST"])
+def api_approve_campaign(camp_id):
+    """Give consent for a campaign that was created without a consent gate,
+    then kick off the calling pipeline in a background thread."""
+    from datetime import datetime, timezone
+    data     = request.get_json(silent=True) or {}
+    language = data.get("language", "Hindi")
+    region   = data.get("region", "IN")
+
+    init_db()
+    with get_conn() as conn:
+        row = conn.execute("SELECT id, consent_approved_at FROM campaigns WHERE id=?", (camp_id,)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "message": f"Campaign #{camp_id} not found."}), 404
+        # Guard: don't re-approve an already-approved campaign that may already be running
+        if row["consent_approved_at"]:
+            not_called = conn.execute(
+                "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status='not_called'", (camp_id,)
+            ).fetchone()[0]
+            if not_called == 0:
+                return jsonify({"ok": False, "message": f"Campaign #{camp_id} already approved and has no uncalled leads."}), 400
+        conn.execute(
+            "UPDATE campaigns SET consent_approved_at=? WHERE id=? AND consent_approved_at IS NULL",
+            (datetime.now(timezone.utc).isoformat(), camp_id)
+        )
+        conn.commit()
+
+    import threading
+    t = threading.Thread(
+        target=_run_pipeline_bg,
+        args=(camp_id, language, region),
+        daemon=True,
+    )
+    t.start()
+    return jsonify({"ok": True, "campaign_id": camp_id,
+                    "message": f"Consent recorded — calling pipeline started for campaign #{camp_id}."})
+
+
 def _callie_build_context():
     """Compact live-state snapshot injected into Callie's system prompt."""
     try:
@@ -2545,6 +2733,14 @@ def _callie_tools():
                 "tour_name": {"type": "string", "enum": ["onboarding", "campaign_flow", "whatsapp_flow"]},
             }, "required": ["tour_name"]}
         }},
+        {"type": "function", "function": {
+            "name": "web_search",
+            "description": "Search the web for current information, prices, news, company info, or anything the user asks about that isn't in the dashboard data. Use for questions like 'what is the price of X', 'who is Y company', 'latest news on Z'.",
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string", "description": "The search query"},
+                "max_results": {"type": "integer", "description": "Number of results (default 4, max 6)"},
+            }, "required": ["query"]}
+        }},
     ]
 
 
@@ -2710,6 +2906,7 @@ def _callie_exec_tool(fn_name, fn_args):
 
         elif fn_name == "run_discovery_and_call":
             import threading
+            from datetime import datetime
             from discovery import discover_vendors as _dv, _looks_spam
             from scoring import score_lead
             from models import Campaign, Lead
@@ -2725,7 +2922,8 @@ def _callie_exec_tool(fn_name, fn_args):
                 return {"error": "No vendors found — try a broader location."}, None
             with get_conn() as conn:
                 campaign = Campaign(product_description=product, location=location,
-                                    consent_basis="client-reviewed-and-approved", consent_approved_at=None)
+                                    consent_basis="client-reviewed-and-approved",
+                                    consent_approved_at=datetime.utcnow().isoformat())
                 campaign.save(conn)
                 camp_id = campaign.id
                 count = 0
@@ -2901,6 +3099,19 @@ def _callie_exec_tool(fn_name, fn_args):
             tour_name = fn_args.get("tour_name", "onboarding")
             return {"tour_started": True, "tour_name": tour_name}, {"type": "start_tour", "tour_name": tour_name}
 
+        elif fn_name == "web_search":
+            query = fn_args.get("query", "")
+            max_r = min(int(fn_args.get("max_results", 4)), 6)
+            if not query:
+                return {"error": "No query provided."}, None
+            try:
+                from ddgs import DDGS
+                raw = list(DDGS().text(query, max_results=max_r))
+                results = [{"title": r.get("title",""), "url": r.get("href",""), "snippet": r.get("body","")} for r in raw]
+                return {"query": query, "results": results, "count": len(results)}, None
+            except Exception as e:
+                return {"error": f"Search failed: {str(e)}"}, None
+
         else:
             return {"error": f"Unknown tool: {fn_name}"}, None
 
@@ -2917,7 +3128,7 @@ def api_chat():
     data         = request.get_json(force=True) or {}
     user_msg     = (data.get("message") or "").strip()
     history      = data.get("history", [])[-6:]
-    biz_name     = (data.get("business_name") or "the client").strip()
+    biz_name     = (data.get("business_name") or data.get("biz_name") or "the client").strip()
 
     if not user_msg:
         return jsonify({"reply": "How can I help you?"}), 200
@@ -2947,6 +3158,7 @@ WHAT CALL-E DOES:
 - Tabs: Leads (all vendors), Analytics (charts), Map (geo view), Live (watch calls happen), Wizard (step-by-step campaign builder).
 - Themes: change the dashboard's look (midnight/purple_haze/emerald/ocean).
 - Tours: start a guided walkthrough (onboarding/campaign_flow/whatsapp_flow).
+- Web Search: I can search the internet for current prices, news, company info, or any general question.
 
 LIVE DATA for {biz_name}:
 {ctx}
@@ -2959,6 +3171,14 @@ PLATFORM GUIDE (common questions):
 - "How do I find vendors?" → Use Discovery: tell me the product + city. Offer the campaign_flow tour.
 - "Why no positive leads?" → Try a different location or product; low scores = weak matches.
 - "What happens after a call?" → Outcome logged, R2 auto-scheduled if no answer, WhatsApp for positives.
+
+CAMPAIGN FLOW: When user asks to find vendors/start a campaign:
+1. Call discover_vendors → show the vendor list to user
+2. ALWAYS ask: "Found X vendors for [product] in [location]. Confirm you have a legitimate business reason to contact them? Type YES to start calling."
+3. Only call start_campaign after user explicitly says yes/confirm/proceed.
+4. Never call run_discovery_and_call directly — always use the 2-step flow.
+
+WEB SEARCH: Use web_search for any question about current events, prices, companies, or general knowledge not found in the dashboard. Keep search queries concise and specific.
 
 RULES: Before a tool runs, say what you're doing. After, react to data — don't just dump it. Use tools for real numbers, never make them up. Confirm every action. Never say "I can't" — always offer a workaround."""
 
@@ -2982,6 +3202,9 @@ RULES: Before a tool runs, say what you're doing. After, react to data — don't
         "schedule","scheduled","navigate","switch","open","overview","results","result",
         "retry","message","map","status","pending","no answer","no-answer","launch",
         "supplier","numbers","rate","success","dashboard","tab","walkthrough","guide me",
+        "search","google","look up","news","price","current","latest","who is",
+        "what is the price","internet","web",
+        "yes","confirm","proceed",
     }
     _SIMPLE_PATTERNS = (
         "hi","hello","hey","thanks","thank you","ok","okay","cool","nice","what","who",
@@ -3031,7 +3254,7 @@ RULES: Before a tool runs, say what you're doing. After, react to data — don't
             method="POST"
         )
         try:
-            with _ur.urlopen(req, timeout=30) as r:
+            with _ur.urlopen(req, timeout=25) as r:
                 return json.loads(r.read()), None, ""
         except _ue.HTTPError as e:
             return None, e.code, e.read().decode("utf-8", errors="replace")
@@ -3076,10 +3299,39 @@ RULES: Before a tool runs, say what you're doing. After, react to data — don't
             return None, f"Groq error {code}: {str(body)[:200]}"
         return None, f"All {len(_all_keys)} Groq keys are rate-limited. Try again in a moment!"
 
+    # Track results of tools we ran so we can still confirm success even if the
+    # follow-up summarization call fails (e.g. all Groq keys hit 429 mid-request).
+    ran_tools = []  # list of (fn_name, result_dict)
+
+    def _fallback_reply():
+        """Human-friendly confirmation built from tool results when Groq can't
+        summarize. Prefer a tool's own 'message', else acknowledge the action."""
+        if ran_tools:
+            msgs, errs = [], []
+            for _fn, _res in ran_tools:
+                if isinstance(_res, dict):
+                    if _res.get("message"):
+                        msgs.append(str(_res["message"]))
+                    elif _res.get("error"):
+                        errs.append(str(_res["error"]))
+                    else:
+                        msgs.append(f"Done: {_fn.replace('_', ' ')}.")
+                else:
+                    msgs.append(f"Done: {_fn.replace('_', ' ')}.")
+            if msgs:
+                return " ".join(msgs)
+            if errs:
+                return "I hit a problem running that: " + "; ".join(errs)
+        return None
+
     for turn in range(3):
         use_tools = (turn < 2) and not (turn == 0 and _skip_tools_first_turn)
         resp, err = _groq_call(messages, use_tools)
         if err:
+            fb = _fallback_reply()
+            if fb:
+                # Tools already succeeded — confirm the action instead of dumping the error.
+                return jsonify({"reply": fb, "actions": actions}), 200
             return jsonify({"reply": f"Hmm, hit a snag — {err}", "actions": actions}), 200
 
         choice = resp["choices"][0]
@@ -3094,6 +3346,7 @@ RULES: Before a tool runs, say what you're doing. After, react to data — don't
                 except Exception:
                     fn_args = {}
                 result, action = _callie_exec_tool(fn_name, fn_args)
+                ran_tools.append((fn_name, result))
                 if action:
                     actions.extend(action if isinstance(action, list) else [action])
                 messages.append({
@@ -3103,9 +3356,14 @@ RULES: Before a tool runs, say what you're doing. After, react to data — don't
                 })
         else:
             reply = (msg.get("content") or "").strip()
+            if not reply:
+                # Model returned empty content — fall back to a tool-based confirmation.
+                reply = _fallback_reply() or "Done! Anything else?"
             return jsonify({"reply": reply, "actions": actions}), 200
 
-    return jsonify({"reply": "I ran into a loop — could you rephrase?", "actions": actions}), 200
+    # Loop exhausted (model kept calling tools). Confirm what actually ran.
+    return jsonify({"reply": _fallback_reply() or "I ran into a loop — could you rephrase?",
+                    "actions": actions}), 200
 
 
 if __name__ == "__main__":
